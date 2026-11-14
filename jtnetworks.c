@@ -572,20 +572,72 @@ typedef struct {
 /*  Drawing primitives                                                 */
 /* ------------------------------------------------------------------ */
 
-static void soft_glow(cairo_t *cr, double cx, double cy, double radius,
-                      unsigned hex, double alpha)
+/* A full-window radial gradient is very expensive for Cairo to rasterize.
+ * Pre-render each glow colour once into a small sprite and paint that scaled;
+ * the glows are smooth and low-alpha, so bilinear scaling is visually
+ * identical. */
+#define GLOW_SIZE 256
+#define GLOW_CACHE 8
+
+static struct {
+    unsigned hex;
+    cairo_surface_t *surf;
+} g_glows[GLOW_CACHE];
+static int g_glow_count;
+
+static cairo_surface_t *glow_make(unsigned hex)
 {
-    if (alpha <= 0.0)
-        return;
-    cairo_pattern_t *p = cairo_pattern_create_radial(cx, cy, 0,
-                                                     cx, cy, radius);
-    cairo_pattern_add_color_stop_rgba(p, 0.0, R_(hex), G_(hex), B_(hex), alpha);
-    cairo_pattern_add_color_stop_rgba(p, 0.55, R_(hex), G_(hex), B_(hex),
-                                      alpha * 0.32);
-    cairo_pattern_add_color_stop_rgba(p, 1.0, R_(hex), G_(hex), B_(hex), 0.0);
+    cairo_surface_t *s = cairo_image_surface_create(
+        CAIRO_FORMAT_ARGB32, GLOW_SIZE, GLOW_SIZE);
+    cairo_t *cr = cairo_create(s);
+    double c = GLOW_SIZE / 2.0;
+    cairo_pattern_t *p = cairo_pattern_create_radial(c, c, 0.0, c, c, c);
+    cairo_pattern_add_color_stop_rgba(p, 0.0,
+        R_(hex), G_(hex), B_(hex), 1.0);
+    cairo_pattern_add_color_stop_rgba(p, 0.55,
+        R_(hex), G_(hex), B_(hex), 0.32);
+    cairo_pattern_add_color_stop_rgba(p, 1.0,
+        R_(hex), G_(hex), B_(hex), 0.0);
     cairo_set_source(cr, p);
     cairo_paint(cr);
     cairo_pattern_destroy(p);
+    cairo_destroy(cr);
+    return s;
+}
+
+static cairo_surface_t *glow_get(unsigned hex)
+{
+    for (int i = 0; i < g_glow_count; i++)
+        if (g_glows[i].hex == hex)
+            return g_glows[i].surf;
+
+    if (g_glow_count >= GLOW_CACHE) {
+        for (int i = 0; i < g_glow_count; i++)
+            cairo_surface_destroy(g_glows[i].surf);
+        g_glow_count = 0;
+    }
+
+    cairo_surface_t *s = glow_make(hex);
+    g_glows[g_glow_count].hex = hex;
+    g_glows[g_glow_count].surf = s;
+    g_glow_count++;
+    return s;
+}
+
+static void soft_glow(cairo_t *cr, double cx, double cy, double radius,
+                      unsigned hex, double alpha)
+{
+    if (alpha <= 0.0 || radius <= 0.0)
+        return;
+    cairo_surface_t *s = glow_get(hex);
+    double k = (2.0 * radius) / GLOW_SIZE;
+    cairo_save(cr);
+    cairo_translate(cr, cx - radius, cy - radius);
+    cairo_scale(cr, k, k);
+    cairo_set_source_surface(cr, s, 0.0, 0.0);
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+    cairo_paint_with_alpha(cr, alpha);
+    cairo_restore(cr);
 }
 
 static void line(cairo_t *cr, double x1, double y1, double x2, double y2,
@@ -2691,6 +2743,11 @@ struct App {
     uint32_t cursor_shape;
 
     int configured;
+    int dirty;
+
+    /* One outstanding wl_surface.frame callback.  Painting is paced by the
+     * compositor: at most one paint per refresh, and none while idle. */
+    struct wl_callback *frame_cb;
 
     /* Window geometry remembered across runs.  Wayland leaves placement to
      * the compositor, so only size and maximized state are persisted. */
@@ -2723,7 +2780,6 @@ struct App {
     double pointer_x;
     double pointer_y;
     double resync_at;
-    int dirty;
 
     /* Cached static frame.  Ambient animation only redraws the dynamic
      * decoration on top of this surface, keeping idle CPU low. */
@@ -2731,6 +2787,9 @@ struct App {
     int base_valid;
     int base_w;
     int base_h;
+    int draw_w;
+    int draw_h;
+    double resize_settle_at;
 
     int action_fd;
     pid_t action_pid;
@@ -3028,6 +3087,26 @@ static int build_base_cache(App *a, int w, int h)
     return 1;
 }
 
+static void frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    (void)time;
+    App *a = data;
+    wl_callback_destroy(cb);
+    a->frame_cb = NULL;
+}
+
+static const struct wl_callback_listener frame_listener = {
+    .done = frame_done,
+};
+
+static void request_frame(App *a)
+{
+    if (!a->surface || a->frame_cb)
+        return;
+    a->frame_cb = wl_surface_frame(a->surface);
+    wl_callback_add_listener(a->frame_cb, &frame_listener, a);
+}
+
 static int app_draw(App *a, int use_cache)
 {
     if (!a->configured || !a->surface || !a->shm)
@@ -3037,6 +3116,19 @@ static int app_draw(App *a, int use_cache)
     int h = (int)lround(WIN_H * a->scale);
     if (w < 1 || h < 1)
         return 0;
+
+    /* While the window is actively resizing, paint straight to the buffer.
+     * Rebuilding the cached base surface at every intermediate size costs an
+     * allocation plus a full copy per step; wait until the size settles, then
+     * re-cache once for the idle animation. */
+    double now = mono_sec();
+    if (w != a->draw_w || h != a->draw_h) {
+        a->draw_w = w;
+        a->draw_h = h;
+        a->resize_settle_at = now + 0.18;
+        a->base_valid = 0;
+    }
+    int settled = now >= a->resize_settle_at;
 
     ShmBuf *b = next_buffer(a, w, h);
     if (!b)
@@ -3055,7 +3147,7 @@ static int app_draw(App *a, int use_cache)
     cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
-    if (use_cache) {
+    if (use_cache && settled) {
         if (!a->base_valid || a->base_w != w || a->base_h != h) {
             if (!build_base_cache(a, w, h)) {
                 cairo_destroy(cr);
@@ -3098,6 +3190,7 @@ static int app_draw(App *a, int use_cache)
         wl_surface_set_buffer_scale(a->surface, a->scale);
     wl_surface_attach(a->surface, b->buffer, 0, 0);
     wl_surface_damage(a->surface, 0, 0, (int)WIN_W, (int)WIN_H);
+    request_frame(a);
     wl_surface_commit(a->surface);
     b->busy = 1;
     return 1;
@@ -3971,6 +4064,7 @@ static void toplevel_configure(void *data, struct xdg_toplevel *t,
             a->state_h = height;
         }
     }
+    mark_dirty(a);
 }
 
 static void toplevel_close(void *data, struct xdg_toplevel *t)
@@ -5207,6 +5301,10 @@ static void app_cleanup(App *a)
 {
     ctl_cleanup(a);
     cancel_action(a);
+    if (a->frame_cb) {
+        wl_callback_destroy(a->frame_cb);
+        a->frame_cb = NULL;
+    }
     if (a->net_cancel) {
         g_cancellable_cancel(a->net_cancel);
         g_clear_object(&a->net_cancel);
@@ -5610,16 +5708,22 @@ int main(int argc, char **argv)
 
         int ambient = a.configured && !a.ui.connect_open;
         int need_draw = a.dirty || animating || ambient || caret_animating;
-        if (need_draw &&
-            (a.last_draw == 0.0 || now - a.last_draw >= interval)) {
+        int due = a.dirty || a.last_draw == 0.0 ||
+                  now - a.last_draw >= interval;
+        if (need_draw && due && !a.frame_cb) {
             if (app_draw(&a, use_cache)) {
                 a.dirty = 0;
                 a.last_draw = now;
             }
         }
 
+        /* Pending frame callbacks wake us at the next refresh, so resizes
+         * repaint immediately.  With no callback outstanding we sleep until
+         * the next ambient animation frame. */
         int timeout = 200;
         if (!a.configured) {
+            timeout = 100;
+        } else if (a.frame_cb) {
             timeout = 100;
         } else if (need_draw) {
             double wait = interval - (mono_sec() - a.last_draw);
