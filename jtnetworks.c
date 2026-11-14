@@ -67,8 +67,10 @@
 /*  Look & feel                                                        */
 /* ------------------------------------------------------------------ */
 
-#define WIN_W 880.0
-#define WIN_H 600.0
+#define WIN_W_DESIGN 880.0
+#define WIN_H_DESIGN 600.0
+static double WIN_W = WIN_W_DESIGN;
+static double WIN_H = WIN_H_DESIGN;
 
 /* Idle decorative motion.  The static UI is cached, so this is cheap. */
 #define AMBIENT_FPS 30.0
@@ -938,7 +940,7 @@ static void paint_brand_bars(cairo_t *cr, Ui *u)
 static void paint_ornament_dots(cairo_t *cr, Ui *u)
 {
     const double ox = SIDEBAR_X + SIDEBAR_W / 2.0;
-    const double oy = 495.0;
+    const double oy = SIDEBAR_Y + SIDEBAR_H - 91.0;
     double a1 = u->deco_t * 0.32;
     double a2 = a1 + PI;
     dot(cr, ox + cos(a1) * 38.0, oy + sin(a1) * 38.0, 2.0, C_FG, 0.45);
@@ -1028,7 +1030,7 @@ static void paint_sidebar(cairo_t *cr, Ui *u)
 
     /* quiet ornament ------------------------------------------------ */
     const double ox = SIDEBAR_X + SIDEBAR_W / 2.0;
-    const double oy = 495.0;
+    const double oy = SIDEBAR_Y + SIDEBAR_H - 91.0;
     ring(cr, ox, oy, 38.0, 1.0, C_ACCENT, 0.065);
     ring(cr, ox, oy, 29.0, 1.0, C_ACCENT, 0.075);
     ring(cr, ox, oy, 20.0, 1.0, C_ACCENT, 0.085);
@@ -1038,9 +1040,9 @@ static void paint_sidebar(cairo_t *cr, Ui *u)
         paint_ornament_dots(cr, u);
 
     text_draw(cr, "JTLab Networks", 8.0, 500, C_FAINT, 0.82,
-              ox, 550.0, ALIGN_CENTER, 0.9);
+              ox, SIDEBAR_Y + SIDEBAR_H - 36.0, ALIGN_CENTER, 0.9);
     text_draw(cr, "v1.0", 7.2, 500, C_FAINT, 0.55,
-              ox, 565.0, ALIGN_CENTER, 0.6);
+              ox, SIDEBAR_Y + SIDEBAR_H - 21.0, ALIGN_CENTER, 0.6);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1668,7 +1670,7 @@ static void paint_bt_adapter_card(cairo_t *cr, Ui *u)
         return;
 
     double y = LIST_Y + u->bt_count * (ROW_H + ROW_GAP) + 2.0;
-    if (y + 46.0 > 546.0)
+    if (y + 46.0 > WIN_H - 54.0)
         return;
 
     rounded_rect(cr, CONTENT_X, y, CONTENT_W, 46.0, 10.0);
@@ -1769,50 +1771,51 @@ static void paint_empty_state(cairo_t *cr, Ui *u, int is_wifi, int radio_off)
 
 static void paint_footer(cairo_t *cr, Ui *u)
 {
-    line(cr, CONTENT_X, 558.0, WIN_W - 24.0, 558.0,
+    double fy = WIN_H - 42.0;
+    line(cr, CONTENT_X, fy, WIN_W - 24.0, fy,
          1.0, C_BORDER, 0.22);
 
     double mix = u->tab_mix;
     if (mix < 0.999) {
         if (u->wifi_msg[0]) {
             unsigned mc = u->wifi_msg_ok ? C_GREEN : C_RED;
-            dot(cr, CONTENT_X + 3.0, 571.0, 2.5, mc,
+            dot(cr, CONTENT_X + 3.0, WIN_H - 29.0, 2.5, mc,
                 (1.0 - mix) * 0.85);
             text_draw(cr, u->wifi_msg, 8.2, 500, mc,
-                      (1.0 - mix) * 0.82, CONTENT_X + 12.0, 565.0,
+                      (1.0 - mix) * 0.82, CONTENT_X + 12.0, WIN_H - 35.0,
                       ALIGN_LEFT, 0.2);
         } else {
-            dot(cr, CONTENT_X + 3.0, 571.0, 2.5,
+            dot(cr, CONTENT_X + 3.0, WIN_H - 29.0, 2.5,
                 u->wifi_on ? C_GREEN : C_FAINT,
                 (1.0 - mix) * (u->wifi_on ? 0.85 : 0.50));
             text_draw(cr, u->wifi_on ? "Wi-Fi radio enabled" :
                       "Wi-Fi radio off",
                       8.2, 500, u->wifi_on ? C_DIM : C_FAINT,
-                      (1.0 - mix) * 0.72, CONTENT_X + 12.0, 565.0,
+                      (1.0 - mix) * 0.72, CONTENT_X + 12.0, WIN_H - 35.0,
                       ALIGN_LEFT, 0.35);
         }
     }
     if (mix > 0.001) {
         if (u->bt_msg[0]) {
             unsigned mc = u->bt_msg_ok ? C_GREEN : C_RED;
-            dot(cr, CONTENT_X + 3.0, 571.0, 2.5, mc, mix * 0.85);
+            dot(cr, CONTENT_X + 3.0, WIN_H - 29.0, 2.5, mc, mix * 0.85);
             text_draw(cr, u->bt_msg, 8.2, 500, mc,
-                      mix * 0.82, CONTENT_X + 12.0, 565.0,
+                      mix * 0.82, CONTENT_X + 12.0, WIN_H - 35.0,
                       ALIGN_LEFT, 0.2);
         } else {
-            dot(cr, CONTENT_X + 3.0, 571.0, 2.5,
+            dot(cr, CONTENT_X + 3.0, WIN_H - 29.0, 2.5,
                 u->bt_on ? C_GREEN : C_FAINT,
                 mix * (u->bt_on ? 0.85 : 0.50));
             text_draw(cr, u->bt_on ? "Bluetooth powered on" :
                       "Bluetooth powered off",
                       8.2, 500, u->bt_on ? C_DIM : C_FAINT,
-                      mix * 0.72, CONTENT_X + 12.0, 565.0,
+                      mix * 0.72, CONTENT_X + 12.0, WIN_H - 35.0,
                       ALIGN_LEFT, 0.35);
         }
     }
 
     text_draw(cr, "WAYLAND · CAIRO + PANGO", 7.6, 500,
-              C_FAINT, 0.55, WIN_W - 24.0, 566.0,
+              C_FAINT, 0.55, WIN_W - 24.0, WIN_H - 34.0,
               ALIGN_RIGHT, 1.25);
 }
 
@@ -2909,7 +2912,7 @@ static int build_base_cache(App *a, int w, int h)
 
     cairo_t *cr = cairo_create(a->base);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_set_source_rgba(cr, R_(C_BG), G_(C_BG), B_(C_BG), 1.0);
     cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_scale(cr, a->scale, a->scale);
@@ -2947,7 +2950,7 @@ static int app_draw(App *a, int use_cache)
 
     cairo_t *cr = cairo_create(surf);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_set_source_rgba(cr, R_(C_BG), G_(C_BG), B_(C_BG), 1.0);
     cairo_paint(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
@@ -2966,7 +2969,7 @@ static int app_draw(App *a, int use_cache)
         cairo_scale(cr, a->scale, a->scale);
 
         cairo_save(cr);
-        rounded_rect(cr, 1.0, 1.0, WIN_W - 2.0, WIN_H - 2.0, 15.0);
+        cairo_rectangle(cr, 0.0, 0.0, WIN_W, WIN_H);
         cairo_clip(cr);
         if (!a->ui.connect_open)
             paint_ambient(cr, &a->ui);
@@ -2980,7 +2983,7 @@ static int app_draw(App *a, int use_cache)
 
     if (a->keyboard_focused) {
         cairo_save(cr);
-        rounded_rect(cr, 1.0, 1.0, WIN_W - 2.0, WIN_H - 2.0, 15.0);
+        cairo_rectangle(cr, 0.0, 0.0, WIN_W, WIN_H);
         cairo_clip(cr);
         paint_connect_caret(cr, &a->ui);
         cairo_restore(cr);
@@ -3844,7 +3847,12 @@ static void toplevel_configure(void *data, struct xdg_toplevel *t,
                                int32_t width, int32_t height,
                                struct wl_array *states)
 {
-    (void)data; (void)t; (void)width; (void)height; (void)states;
+    (void)t; (void)states;
+    (void)data;
+    if (width > 0 && height > 0) {
+        WIN_W = width;
+        WIN_H = height;
+    }
 }
 
 static void toplevel_close(void *data, struct xdg_toplevel *t)
@@ -4731,8 +4739,8 @@ static int wayland_start(App *a)
     xdg_toplevel_add_listener(a->toplevel, &toplevel_listener, a);
     xdg_toplevel_set_title(a->toplevel, "JTLab Networks");
     xdg_toplevel_set_app_id(a->toplevel, "jtnetworks");
-    xdg_toplevel_set_min_size(a->toplevel, (int)WIN_W, (int)WIN_H);
-    xdg_toplevel_set_max_size(a->toplevel, (int)WIN_W, (int)WIN_H);
+    xdg_toplevel_set_min_size(a->toplevel, (int)WIN_W_DESIGN,
+                              (int)WIN_H_DESIGN);
 
     if (a->deco_manager) {
         a->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
