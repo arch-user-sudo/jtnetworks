@@ -103,10 +103,6 @@
 #define TOGGLE_W 62.0
 #define TOGGLE_H 32.0
 
-#define CLOSE_X (WIN_W - 32.0)
-#define CLOSE_Y 34.0
-#define CLOSE_R 14.0
-
 /* Wi-Fi connection dialog */
 #define MODAL_W 380.0
 #define MODAL_H 236.0
@@ -541,7 +537,6 @@ typedef struct {
 
     int hover_nav;       /* -1 none, 0 Wi-Fi, 1 Bluetooth */
     int hover_toggle;
-    int hover_close;
     int hover_scan;
     int hover_pair;
     int hover_enable;
@@ -838,7 +833,7 @@ static void paint_dust(cairo_t *cr, Ui *u)
 
 static void paint_window_base(cairo_t *cr, Ui *u)
 {
-    rounded_rect(cr, 0.5, 0.5, WIN_W - 1.0, WIN_H - 1.0, 16.0);
+    cairo_rectangle(cr, 0, 0, WIN_W, WIN_H);
     cairo_pattern_t *bg = cairo_pattern_create_linear(0, 0, 0, WIN_H);
     cairo_pattern_add_color_stop_rgba(bg, 0.0, R_(C_BG_TOP), G_(C_BG_TOP),
                                       B_(C_BG_TOP), 1.0);
@@ -846,20 +841,11 @@ static void paint_window_base(cairo_t *cr, Ui *u)
                                       B_(C_BG), 1.0);
     cairo_pattern_add_color_stop_rgba(bg, 1.0, 0.012, 0.012, 0.014, 1.0);
     cairo_set_source(cr, bg);
-    cairo_fill_preserve(cr);
+    cairo_fill(cr);
     cairo_pattern_destroy(bg);
 
-    rgba(cr, C_BORDER, 0.85);
-    cairo_set_line_width(cr, 1.0);
-    cairo_stroke(cr);
-
-    rounded_rect(cr, 1.5, 1.5, WIN_W - 3.0, WIN_H - 3.0, 15.0);
-    cairo_set_line_width(cr, 1.0);
-    rgba(cr, C_FG, 0.035);
-    cairo_stroke(cr);
-
     cairo_save(cr);
-    rounded_rect(cr, 1.0, 1.0, WIN_W - 2.0, WIN_H - 2.0, 15.0);
+    cairo_rectangle(cr, 0, 0, WIN_W, WIN_H);
     cairo_clip(cr);
 
     double px = (u->ptr_x / WIN_W - 0.5) * 28.0;
@@ -1135,21 +1121,6 @@ static void paint_toggle(cairo_t *cr, Ui *u, double k)
     }
 }
 
-static void paint_close(cairo_t *cr, Ui *u)
-{
-    if (u->hover_close) {
-        cairo_arc(cr, CLOSE_X, CLOSE_Y, 15.0, 0, 2.0 * PI);
-        rgba(cr, C_FG, 0.07);
-        cairo_fill(cr);
-    }
-    unsigned col = u->hover_close ? C_FG : C_DIM;
-    double a = u->hover_close ? 0.95 : 0.62;
-    line(cr, CLOSE_X - 4.5, CLOSE_Y - 4.5,
-         CLOSE_X + 4.5, CLOSE_Y + 4.5, 1.5, col, a);
-    line(cr, CLOSE_X + 4.5, CLOSE_Y - 4.5,
-         CLOSE_X - 4.5, CLOSE_Y + 4.5, 1.5, col, a);
-}
-
 static void paint_header(cairo_t *cr, Ui *u)
 {
     double mix = u->tab_mix;
@@ -1188,7 +1159,6 @@ static void paint_header(cairo_t *cr, Ui *u)
 
     paint_toggle(cr, u, k);
     (void)on;
-    paint_close(cr, u);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3974,13 +3944,6 @@ static const struct wl_surface_listener surface_listener = {
 
 /* ---- hit testing -------------------------------------------------- */
 
-static int hit_close(double x, double y)
-{
-    double dx = x - CLOSE_X;
-    double dy = y - CLOSE_Y;
-    return dx * dx + dy * dy <= 16.0 * 16.0;
-}
-
 static int hit_toggle(double x, double y)
 {
     return x >= TOGGLE_X - 4.0 && x <= TOGGLE_X + TOGGLE_W + 4.0 &&
@@ -4143,7 +4106,6 @@ static int update_hover(App *a)
     if (a->ui.connect_open) {
         SET_HOVER(hover_nav, -1);
         SET_HOVER(hover_toggle, 0);
-        SET_HOVER(hover_close, 0);
         SET_HOVER(hover_scan, 0);
         SET_HOVER(hover_pair, 0);
         SET_HOVER(hover_enable, 0);
@@ -4158,7 +4120,6 @@ static int update_hover(App *a)
 
     SET_HOVER(hover_nav, hit_nav(x, y));
     SET_HOVER(hover_toggle, hit_toggle(x, y));
-    SET_HOVER(hover_close, hit_close(x, y));
     SET_HOVER(hover_scan, hit_scan(a, x, y));
     SET_HOVER(hover_pair, hit_pair(a, x, y));
     SET_HOVER(hover_enable, hit_enable(a, x, y));
@@ -4192,7 +4153,7 @@ static void update_cursor(App *a)
             shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT;
         else if (a->ui.hover_connect_cancel || a->ui.hover_connect_submit)
             shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
-    } else if (a->ui.hover_close || a->ui.hover_toggle ||
+    } else if (a->ui.hover_toggle ||
         a->ui.hover_scan || a->ui.hover_pair || a->ui.hover_enable ||
         a->ui.hover_row >= 0 || a->ui.hover_nav >= 0) {
         shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
@@ -4302,7 +4263,6 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
     a->pointer_y = -1;
     a->ui.hover_nav = -1;
     a->ui.hover_toggle = 0;
-    a->ui.hover_close = 0;
     a->ui.hover_scan = 0;
     a->ui.hover_pair = 0;
     a->ui.hover_enable = 0;
@@ -4368,9 +4328,7 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
         int nav = hit_nav(x, y);
         int row = hit_row(a, x, y);
         int row_action = hit_row_action(&a->ui, row, x, y);
-        if (hit_close(x, y)) {
-            a->quit = 1;
-        } else if (hit_toggle(x, y)) {
+        if (hit_toggle(x, y)) {
             a->ui.press_toggle = 1;
         } else if (nav >= 0) {
             switch_tab(a, nav);
@@ -4782,7 +4740,7 @@ static int wayland_start(App *a)
         zxdg_toplevel_decoration_v1_add_listener(
             a->decoration, &decoration_listener, a);
         zxdg_toplevel_decoration_v1_set_mode(
-            a->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+            a->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
     }
 
     if (a->icon_manager) {
