@@ -1,6 +1,6 @@
 CC ?= cc
 PKGS = cairo pangocairo wayland-client xkbcommon libnm
-CFLAGS ?= -march=native -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -flto
+CFLAGS ?= -march=native -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -flto -s
 CFLAGS += $(shell pkg-config --cflags $(PKGS))
 LDLIBS = $(shell pkg-config --libs $(PKGS)) -lm
 
