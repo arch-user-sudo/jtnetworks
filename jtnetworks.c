@@ -1170,8 +1170,6 @@ static void paint_toggle(cairo_t *cr, Ui *u, double k)
         cairo_arc(cr, kx, ky, kr, 0, 2.0 * PI);
         rgba(cr, C_ON_ACCENT, k);
         cairo_fill(cr);
-        dot(cr, kx - kr * 0.25, ky - kr * 0.30, kr * 0.30,
-            C_ACCENT_HI, 0.22 * k);
     }
 }
 
