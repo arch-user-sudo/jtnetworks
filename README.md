@@ -28,8 +28,8 @@ It is a Wayland client only. There is no GTK, Qt, X11, or web view.
   are trusted automatically.
 - Asynchronous Wi-Fi scanning through libnm: the window stays responsive
   while NetworkManager scans.
-- Real radio toggles through libnm and `bluetoothctl`, with an `rfkill`
-  fallback for Bluetooth.
+- Real radio toggles through libnm (Wi-Fi) and BlueZ's D-Bus API via
+  GDBus (Bluetooth). Neither backend shells out to a CLI.
 - Keyboard controls and a draggable header.
 - Pointer-shape feedback on interactive controls via
   `wp_cursor_shape_manager_v1`.
@@ -47,16 +47,17 @@ Build dependencies:
 - `cairo`
 - `pangocairo`
 - `libnm` / NetworkManager development headers
+- `glib-2.0` / `gio-2.0` development headers (for GDBus)
 
 Runtime dependencies are optional:
 
 - NetworkManager for Wi-Fi state and toggles (libnm talks to it over D-Bus)
-- `bluetoothctl` / BlueZ for Bluetooth state and toggles
-- `rfkill` as a fallback for the Bluetooth radio toggle
+- BlueZ on the system bus for Bluetooth state, devices, and toggles
+  (accessed through GDBus; no `bluetoothctl` or `rfkill` processes)
 
 Without NetworkManager or BlueZ the panel still renders, but the affected
-tab will show its empty/off state. The Wi-Fi backend does not shell out to
-`nmcli`; it uses libnm directly.
+tab will show its empty/off state. Neither backend shells out to a CLI:
+Wi-Fi uses libnm directly and Bluetooth uses the BlueZ D-Bus API.
 
 ## Build and run
 
@@ -116,7 +117,7 @@ icon gives taskbars and launchers a theme lookup fallback.
 | `Tab`, `Left`, `Right`, `h`, `l` | Switch tab |
 | `1` / `2` | Jump to Wi-Fi / Bluetooth |
 | `Space` | Toggle the active radio |
-| `S` | Scan for Wi-Fi networks / animate the pair action |
+| `S` | Scan for Wi-Fi networks / start or stop Bluetooth device discovery |
 | `q` | Quit |
 | Drag the header | Move the window |
 
@@ -131,14 +132,23 @@ NetworkManager remembers remain listed as saved after a restart, even if
 they are currently out of range. Clicking one activates its stored profile
 without asking for the password again; **FORGET** deletes that profile.
 
-Paired Bluetooth devices can be connected from the row. A successful
-connection is followed automatically by `bluetoothctl trust <MAC>`, and
-any already-connected untrusted device is trusted on the next state
-refresh. **FORGET** removes the pairing with `bluetoothctl remove`.
+Paired Bluetooth devices can be connected or disconnected from the row.
+A successful connection (or pairing) is followed automatically by a
+`Trusted` property change through D-Bus, and any already-connected
+untrusted device is trusted on the next state refresh. **FORGET** removes
+the pairing via `org.freedesktop.DBus.ObjectManager.RemoveDevice`.
 
-The `PAIR NEW` action is currently a visual placeholder. A Bluetooth
-pairing flow is not implemented; existing paired devices are read and
-displayed.
+The `PAIR NEW` action starts real device discovery through BlueZ's
+`org.bluez.Adapter1.StartDiscovery` method. Discovered unpaired devices
+appear as **Nearby** rows with a **PAIR** button; each row calls
+`org.bluez.Device1.Pair`. BlueZ drives the pairing conversation through an
+in-process `org.bluez.Agent1` implementation registered at
+`/org/jtnetworks/BlueZAgent` — PIN entry, passkey entry, numeric
+confirmation, and authorization prompts are shown as modal dialogs in the
+panel. While scanning, the button reads **SCANNING**; scanning continues
+until that button is clicked again or the app exits. All Bluetooth
+operations use BlueZ D-Bus interfaces via GIO/GDBus; no CLI helper processes
+are spawned.
 
 ## Screenshot mode
 
@@ -185,15 +195,23 @@ make preview-bt
   and redraws only the animated overlay. In testing this keeps idle
   cost around 10% of one core instead of repainting the whole window.
   Tab/radio transitions and changes to the static UI rebuild the cache.
-- Bluetooth state, paired devices, and trust state come from
-  `bluetoothctl`. Row actions run `connect`, `disconnect`, or `remove`
-  directly through `execvp`.
-- A successful Bluetooth connection runs `bluetoothctl trust <MAC>`.
-  During a state refresh, any connected-but-untrusted device is trusted
-  as well. Screenshot mode never mutates Bluetooth state.
+- Bluetooth state and devices come from BlueZ's
+  `org.freedesktop.DBus.ObjectManager.GetManagedObjects` on the system
+  bus, read through GDBus. Row actions call `Device1.Connect`,
+  `Device1.Disconnect`, `Device1.Pair`, or `ObjectManager.RemoveDevice`
+  asynchronously; no helper processes are spawned. BlueZ property/object
+  signals refresh the panel when devices or the adapter change
+  externally.
+- `PAIR NEW` calls `Adapter1.StartDiscovery` / `StopDiscovery` and shows
+  discovered unpaired devices as **Nearby** rows. An in-process
+  `org.bluez.Agent1` answers BlueZ's PIN, passkey, confirmation, and
+  authorization requests through a modal dialog in the panel.
+- A successful Bluetooth connection or pairing sets `Device1.Trusted`
+  via `Properties.Set`. During a state refresh, any connected-but-untrusted
+  device is trusted as well. Screenshot mode never mutates Bluetooth
+  state.
 - The Wi-Fi radio toggle uses the NetworkManager D-Bus property through
-  libnm; the Bluetooth toggle prefers `bluetoothctl` and falls back to
-  `rfkill`.
+  libnm; the Bluetooth toggle sets `Adapter1.Powered` over D-Bus.
 - After an action or toggle the panel re-reads the real state shortly
   afterwards.
 - The Wi-Fi list is sorted with the connected network first, then saved

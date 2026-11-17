@@ -21,11 +21,12 @@
  *   Enter / Esc          connect / cancel in that dialog
  *   Row buttons          disconnect or forget saved networks/devices
  *
- * The Wi-Fi side uses libnm, NetworkManager's client library. Bluetooth
- * still uses BlueZ's bluetoothctl CLI when available. State is read back
- * after a change so the panel reflects the real radios. Saved Wi-Fi
- * profiles stay in the list even when out of range, and connected
- * Bluetooth devices are trusted automatically.
+ * Both radios use shared libraries: Wi-Fi through libnm (NetworkManager's
+ * client library) and Bluetooth through BlueZ's D-Bus API via GDBus. No
+ * helper processes are spawned. State is read back after a change so the
+ * panel reflects the real radios. Saved Wi-Fi profiles stay in the list
+ * even when out of range, and connected Bluetooth devices are trusted
+ * automatically.
  *
  * Palette from ~/JTLab/config.h:
  *   bg #030303, fg #FFFFFF, borders #404040,
@@ -37,6 +38,7 @@
 #include <cairo/cairo.h>
 #include <pango/pangocairo.h>
 #include <NetworkManager.h>
+#include <gio/gio.h>
 
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
@@ -59,9 +61,29 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+/* BlueZ D-Bus API.  Bluetooth state and actions go through the system
+ * bus, the same way Wi-Fi goes through libnm's D-Bus calls. */
+#define BLUEZ_SERVICE              "org.bluez"
+#define BLUEZ_ROOT_PATH            "/"
+#define BLUEZ_ADAPTER_IFACE        "org.bluez.Adapter1"
+#define BLUEZ_DEVICE_IFACE         "org.bluez.Device1"
+#define BLUEZ_AGENT_IFACE          "org.bluez.Agent1"
+#define BLUEZ_AGENT_MANAGER_IFACE  "org.bluez.AgentManager1"
+#define BLUEZ_AGENT_PATH           "/org/jtnetworks/BlueZAgent"
+#define BLUEZ_PROPERTIES_IFACE     "org.freedesktop.DBus.Properties"
+#define BLUEZ_OBJECT_MANAGER_IFACE "org.freedesktop.DBus.ObjectManager"
+#define BLUEZ_MANAGED_OBJECTS_TYPE "(a{oa{sa{sv}}})"
+#define BT_STATE_TIMEOUT_MS        2000
+#define BT_ACTION_TIMEOUT_MS       30000
+#define BT_PAIR_TIMEOUT_MS         120000
+#define BT_SET_TIMEOUT_MS          5000
+#define BT_STOP_TIMEOUT_MS         1500
+
+/* In-flight Bluetooth operations, tracked like the libnm async ops. */
+enum { BT_OP_POWER = 20, BT_OP_TRUST };
 
 /* ------------------------------------------------------------------ */
 /*  Look & feel                                                        */
@@ -149,6 +171,7 @@ static unsigned on_accent_rgb = 0x14100A;
 #define MAX_SAVED 16
 #define MAX_CANDIDATES 96
 #define MAX_BT   4
+#define MAX_BT_FOUND 8
 
 #define R_(h) ((((h) >> 16) & 0xFF) / 255.0)
 #define G_(h) ((((h) >> 8) & 0xFF) / 255.0)
@@ -334,17 +357,6 @@ static double approach(double cur, double target, double dt, double speed)
     return cur + (target - cur) * (1.0 - exp(-dt * speed));
 }
 
-static char *trim(char *s)
-{
-    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
-        s++;
-    char *e = s + strlen(s);
-    while (e > s && (e[-1] == ' ' || e[-1] == '\t' ||
-                     e[-1] == '\r' || e[-1] == '\n'))
-        *--e = 0;
-    return s;
-}
-
 /* ------------------------------------------------------------------ */
 /*  Text                                                               */
 /* ------------------------------------------------------------------ */
@@ -450,8 +462,20 @@ enum {
     BT_ACTION_NONE = 0,
     BT_ACTION_DISCONNECT = 11,
     BT_ACTION_FORGET,
-    BT_ACTION_CONNECT
+    BT_ACTION_CONNECT,
+    BT_ACTION_PAIR
 };
+
+/* What the BlueZ agent is currently asking the user about. */
+typedef enum {
+    PAIR_MODAL_NONE = 0,
+    PAIR_MODAL_PIN,           /* RequestPinCode  — user types a PIN */
+    PAIR_MODAL_PASSKEY,       /* RequestPasskey  — user types a passkey */
+    PAIR_MODAL_CONFIRM,       /* RequestConfirmation — yes/no */
+    PAIR_MODAL_DISPLAY_PIN,   /* DisplayPinCode  — show code, acknowledge */
+    PAIR_MODAL_DISPLAY_PASSKEY,/* DisplayPasskey  — show code, acknowledge */
+    PAIR_MODAL_AUTHORIZE      /* RequestAuthorization / AuthorizeService */
+} PairModalKind;
 
 typedef enum {
     DEV_GENERIC = 0,
@@ -480,9 +504,12 @@ typedef struct {
     int active;
 } SavedWifi;
 
+typedef struct BtOp BtOp;
+
 typedef struct {
     char name[96];
     char mac[24];
+    char path[128];         /* BlueZ Device1 object path */
     DevKind kind;
     int connected;
     int trusted;
@@ -521,14 +548,16 @@ typedef struct {
     int wifi_msg_ok;
 
     char bt_name[96];
+    char bt_adapter_path[128];
     int bt_discoverable;
     BtDev bt[MAX_BT];
     int bt_count;
     int bt_paired_total;
+    BtDev bt_found[MAX_BT_FOUND];   /* unpaired devices seen while scanning */
+    int bt_found_count;
+    int bt_discovering;
     int bt_action_kind;
     int bt_action_row;
-    char bt_action_name[96];
-    char bt_action_mac[24];
     char bt_msg[160];
     double bt_msg_t;
     int bt_msg_ok;
@@ -562,11 +591,35 @@ typedef struct {
     int hover_connect_cancel;
     int hover_connect_submit;
 
+    /* Bluetooth pairing dialog (driven by the BlueZ Agent1 calls) */
+    int pair_open;
+    PairModalKind pair_kind;
+    char pair_device[96];
+    char pair_code[32];
+    char pair_entry[32];
+    char pair_msg[160];
+    double pair_caret_t;
+    int hover_pair_field;
+    int hover_pair_cancel;
+    int hover_pair_confirm;
+
     double scan_t;
-    double pair_t;
     double ptr_x;
     double ptr_y;
 } Ui;
+
+/* Forward declarations shared by the drawing code, the input handlers, and
+ * the BlueZ pairing agent (all defined later in this file). */
+struct App;
+static void mark_dirty(struct App *a);
+static int update_hover(struct App *a);
+static void update_cursor(struct App *a);
+static void paint_pair_modal(cairo_t *cr, Ui *u);
+static void paint_pair_caret(cairo_t *cr, Ui *u);
+static void bt_agent_cancel(struct App *a);
+static void bt_agent_register(struct App *a);
+static void bt_agent_unregister(struct App *a);
+static void stop_bt_discovery(struct App *a);
 
 /* ------------------------------------------------------------------ */
 /*  Drawing primitives                                                 */
@@ -1425,19 +1478,21 @@ static void section_action_ambient(cairo_t *cr, Ui *u, int action_kind)
     unsigned ic = enabled ? (hover ? C_ACCENT_HI : C_ACCENT) : C_FAINT;
     double ia = enabled ? (hover ? 1.0 : 0.82) : 0.35;
 
-    if (action_kind == 0)
+    if (action_kind == 0) {
         radar_icon(cr, bx + 18.0, by + 14.0, 6.2, ic, ia, u->deco_t);
 
-    double at = action_kind == 0 ? u->scan_t : u->pair_t;
-    double age = u->t - at;
-    if (enabled && age >= 0.0 && age < 2.0) {
-        double a = age * 7.0;
-        cairo_set_line_width(cr, 1.4);
-        cairo_new_path(cr);
-        cairo_arc(cr, bx + 18.0, by + 14.0, 8.5,
-                  a, a + PI * 1.25);
-        rgba(cr, C_ACCENT, 0.9);
-        cairo_stroke(cr);
+        /* Keep the brief completion sweep on Wi-Fi's SCAN only.  The
+         * Bluetooth button conveys its state with the label instead. */
+        double age = u->t - u->scan_t;
+        if (enabled && age >= 0.0 && age < 2.0) {
+            double a = age * 7.0;
+            cairo_set_line_width(cr, 1.4);
+            cairo_new_path(cr);
+            cairo_arc(cr, bx + 18.0, by + 14.0, 8.5,
+                      a, a + PI * 1.25);
+            rgba(cr, C_ACCENT, 0.9);
+            cairo_stroke(cr);
+        }
     }
 }
 
@@ -1467,6 +1522,11 @@ static void section_header(cairo_t *cr, Ui *u, const char *label,
     if (action_kind == 0) {
         text_draw(cr, action, 8.0, 600, ic, ia,
                   bx + 33.0, by + 8.0, ALIGN_LEFT, 1.1);
+    } else if (u->bt_discovering) {
+        /* Scanning is spelled out by the label, so drop the plus icon and
+         * center the word in the button. */
+        text_draw(cr, action, 8.0, 600, ic, ia,
+                  bx + bw / 2.0, by + 8.0, ALIGN_CENTER, 1.1);
     } else {
         plus_icon(cr, bx + 17.0, by + 14.0, 8.0, ic, ia);
         text_draw(cr, action, 8.0, 600, ic, ia,
@@ -1511,7 +1571,7 @@ static int action_is_forget(int kind)
 
 static int action_is_connect(int kind)
 {
-    return kind == BT_ACTION_CONNECT;
+    return kind == BT_ACTION_CONNECT || kind == BT_ACTION_PAIR;
 }
 
 static void row_action_rect(int kind, double right, double y,
@@ -1520,6 +1580,10 @@ static void row_action_rect(int kind, double right, double y,
     if (action_is_forget(kind)) {
         *w = ROW_ACTION_FORGET_W;
         *x = right - ROW_ACTION_FORGET_W;
+    } else if (kind == BT_ACTION_PAIR) {
+        /* A discovered row has only one action, so it sits flush right. */
+        *w = ROW_ACTION_DISCONNECT_W;
+        *x = right - *w;
     } else {
         *w = ROW_ACTION_DISCONNECT_W;
         *x = right - ROW_ACTION_FORGET_W - ROW_ACTION_GAP -
@@ -1548,8 +1612,14 @@ static void paint_row_action(cairo_t *cr, Ui *u, int row, int kind,
     rgba(cr, border, hovered ? 0.54 : (forget ? 0.22 : 0.32));
     cairo_stroke(cr);
 
-    text_draw(cr, forget ? "FORGET" : (connect ? "CONNECT" : "DISCONNECT"),
-              7.2, 600, fg,
+    const char *label = "DISCONNECT";
+    if (forget)
+        label = "FORGET";
+    else if (kind == BT_ACTION_PAIR)
+        label = "PAIR";
+    else if (connect)
+        label = "CONNECT";
+    text_draw(cr, label, 7.2, 600, fg,
               hovered ? 0.95 : (forget ? 0.66 : 0.82),
               x + w / 2.0, y + 5.5, ALIGN_CENTER, 0.8);
 }
@@ -1660,8 +1730,10 @@ static const char *dev_kind_name(DevKind k)
 
 static void paint_bt_list(cairo_t *cr, Ui *u)
 {
-    for (int i = 0; i < u->bt_count && i < 4; i++) {
-        BtDev *d = &u->bt[i];
+    int total = u->bt_count + u->bt_found_count;
+    for (int i = 0; i < total && i < 4; i++) {
+        int found = i >= u->bt_count;
+        BtDev *d = found ? &u->bt_found[i - u->bt_count] : &u->bt[i];
         double y = LIST_Y + i * (ROW_H + ROW_GAP);
         int hover = (u->hover_row == i);
         row_shell(cr, u, y, d->connected, hover);
@@ -1674,18 +1746,20 @@ static void paint_bt_list(cairo_t *cr, Ui *u)
         rgba(cr, C_BORDER, 0.38);
         cairo_stroke(cr);
         device_glyph(cr, d->kind, CONTENT_X + 37.0, y + 27.0,
-                     17.0, d->connected ? C_ACCENT : C_DIM,
+                     17.0, d->connected ? C_ACCENT : (found ? C_ACCENT : C_DIM),
                      d->connected ? 0.95 : 0.75);
 
         text_draw(cr, d->name, 11.8, d->connected ? 600 : 500,
                   C_FG, d->connected ? 0.96 : 0.80,
                   CONTENT_X + 62.0, y + 11.0, ALIGN_LEFT, 0.0);
-        text_draw(cr, dev_kind_name(d->kind), 8.4, 400, C_DIM, 0.62,
+        text_draw(cr, found ? d->mac : dev_kind_name(d->kind),
+                  8.4, 400, C_DIM, 0.62,
                   CONTENT_X + 62.0, y + 29.0, ALIGN_LEFT, 0.15);
 
-        const char *status = d->connected ? "Connected" : "Paired";
-        unsigned sc = d->connected ? C_GREEN : C_FAINT;
-        double sa = d->connected ? 0.88 : 0.62;
+        const char *status = found ? "Nearby" :
+                             (d->connected ? "Connected" : "Paired");
+        unsigned sc = found ? C_ACCENT : (d->connected ? C_GREEN : C_FAINT);
+        double sa = found ? 0.80 : (d->connected ? 0.88 : 0.62);
         text_draw(cr, status, 8.8, 500, sc, sa,
                   CONTENT_X + CONTENT_W - 20.0, y + 10.0,
                   ALIGN_RIGHT, 0.1);
@@ -1693,23 +1767,31 @@ static void paint_bt_list(cairo_t *cr, Ui *u)
         int busy = (u->bt_action_kind != BT_ACTION_NONE &&
                     u->bt_action_row == i);
         if (busy) {
-            const char *label = u->bt_action_kind == BT_ACTION_DISCONNECT ?
-                                "DISCONNECTING…" :
-                                (u->bt_action_kind == BT_ACTION_FORGET ?
-                                 "FORGETTING…" : "CONNECTING…");
+            const char *label = "CONNECTING…";
+            if (u->bt_action_kind == BT_ACTION_PAIR)
+                label = "PAIRING…";
+            else if (u->bt_action_kind == BT_ACTION_DISCONNECT)
+                label = "DISCONNECTING…";
+            else if (u->bt_action_kind == BT_ACTION_FORGET)
+                label = "FORGETTING…";
             text_draw(cr, label, 7.4, 600, C_ACCENT, 0.86,
                       CONTENT_X + CONTENT_W - 20.0, y + 29.0,
                       ALIGN_RIGHT, 0.8);
         } else {
             double right = CONTENT_X + CONTENT_W - ROW_ACTION_RIGHT_PAD;
             double ay = y + ROW_ACTION_Y_OFF;
-            int main_kind = d->connected ? BT_ACTION_DISCONNECT :
-                                          BT_ACTION_CONNECT;
             double ax, aw;
-            row_action_rect(main_kind, right, ay, &ax, &aw);
-            paint_row_action(cr, u, i, main_kind, ax, ay, aw);
-            row_action_rect(BT_ACTION_FORGET, right, ay, &ax, &aw);
-            paint_row_action(cr, u, i, BT_ACTION_FORGET, ax, ay, aw);
+            if (found) {
+                row_action_rect(BT_ACTION_PAIR, right, ay, &ax, &aw);
+                paint_row_action(cr, u, i, BT_ACTION_PAIR, ax, ay, aw);
+            } else {
+                int main_kind = d->connected ? BT_ACTION_DISCONNECT :
+                                              BT_ACTION_CONNECT;
+                row_action_rect(main_kind, right, ay, &ax, &aw);
+                paint_row_action(cr, u, i, main_kind, ax, ay, aw);
+                row_action_rect(BT_ACTION_FORGET, right, ay, &ax, &aw);
+                paint_row_action(cr, u, i, BT_ACTION_FORGET, ax, ay, aw);
+            }
         }
     }
 }
@@ -1719,8 +1801,10 @@ static void paint_bt_adapter_card(cairo_t *cr, Ui *u)
     if (!u->bt_on || u->bt_count == 0 || u->bt_count >= 4)
         return;
 
-    double y = LIST_Y + u->bt_count * (ROW_H + ROW_GAP) + 2.0;
-    if (y + 46.0 > WIN_H - 54.0)
+    /* Pin the card to the bottom of the list area rather than letting it
+     * float directly under the last row. */
+    double y = WIN_H - 54.0 - 46.0;
+    if (LIST_Y + u->bt_count * (ROW_H + ROW_GAP) > y - 8.0)
         return;
 
     rounded_rect(cr, CONTENT_X, y, CONTENT_W, 46.0, 10.0);
@@ -1756,7 +1840,8 @@ static void paint_bt_adapter_card(cairo_t *cr, Ui *u)
 /*  Empty states and tab bodies                                        */
 /* ------------------------------------------------------------------ */
 
-static void paint_empty_state(cairo_t *cr, Ui *u, int is_wifi, int radio_off)
+static void paint_empty_state(cairo_t *cr, Ui *u, int is_wifi, int radio_off,
+                              int searching)
 {
     double cx = CONTENT_X + CONTENT_W / 2.0;
     double card_y = LIST_Y;
@@ -1789,6 +1874,9 @@ static void paint_empty_state(cairo_t *cr, Ui *u, int is_wifi, int radio_off)
         title = is_wifi ? "Wireless radio is off" : "Bluetooth is off";
         sub = is_wifi ? "Turn the radio on to see nearby networks."
                       : "Turn the radio on to manage devices.";
+    } else if (searching) {
+        title = "Searching for devices…";
+        sub = "Nearby Bluetooth devices will appear here.";
     } else {
         title = is_wifi ? "No networks found" : "No paired devices";
         sub = is_wifi ? "Use SCAN to look again."
@@ -2061,9 +2149,9 @@ static void paint_wifi_tab(cairo_t *cr, Ui *u)
     section_header(cr, u, "NETWORKS", "SCAN", 0);
 
     if (!u->wifi_on)
-        paint_empty_state(cr, u, 1, 1);
+        paint_empty_state(cr, u, 1, 1, 0);
     else if (u->net_count == 0)
-        paint_empty_state(cr, u, 1, 0);
+        paint_empty_state(cr, u, 1, 0, 0);
     else
         paint_wifi_list(cr, u);
 }
@@ -2071,15 +2159,19 @@ static void paint_wifi_tab(cairo_t *cr, Ui *u)
 static void paint_bt_tab(cairo_t *cr, Ui *u)
 {
     paint_hero_bt(cr, u);
-    section_header(cr, u, "PAIRED DEVICES", "PAIR NEW", 1);
+    section_header(cr, u, u->bt_discovering ? "NEARBY DEVICES" :
+                   "PAIRED DEVICES", u->bt_discovering ? "SCANNING" :
+                   "PAIR NEW", 1);
 
+    int total = u->bt_count + u->bt_found_count;
     if (!u->bt_on)
-        paint_empty_state(cr, u, 0, 1);
-    else if (u->bt_count == 0)
-        paint_empty_state(cr, u, 0, 0);
+        paint_empty_state(cr, u, 0, 1, 0);
+    else if (total == 0)
+        paint_empty_state(cr, u, 0, 0, u->bt_discovering);
     else {
         paint_bt_list(cr, u);
-        paint_bt_adapter_card(cr, u);
+        if (!u->bt_discovering)
+            paint_bt_adapter_card(cr, u);
     }
 }
 
@@ -2113,6 +2205,7 @@ static void paint_content(cairo_t *cr, Ui *u)
 
     paint_footer(cr, u);
     paint_connect_modal(cr, u);
+    paint_pair_modal(cr, u);
     cairo_restore(cr); /* window base clip */
 }
 
@@ -2147,39 +2240,6 @@ static void paint_ambient(cairo_t *cr, Ui *u)
 /* ------------------------------------------------------------------ */
 /*  System state                                                       */
 /* ------------------------------------------------------------------ */
-
-static void run_async(const char *cmd)
-{
-    pid_t pid = fork();
-    if (pid == 0) {
-        setsid();
-        pid_t child = fork();
-        if (child == 0) {
-            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-            _exit(127);
-        }
-        _exit(0);
-    }
-    if (pid > 0)
-        waitpid(pid, NULL, 0);
-}
-
-static int read_cmd(const char *cmd, char *out, size_t cap)
-{
-    if (cap == 0)
-        return 0;
-    out[0] = 0;
-    FILE *f = popen(cmd, "r");
-    if (!f)
-        return 0;
-    size_t n = fread(out, 1, cap - 1, f);
-    out[n] = 0;
-    int rc = pclose(f);
-    char *s = trim(out);
-    if (s != out)
-        memmove(out, s, strlen(s) + 1);
-    return rc == 0;
-}
 
 static int net_cmp(const void *a, const void *b)
 {
@@ -2532,167 +2592,6 @@ static void read_ip(Ui *u, NMClient *nm)
         snprintf(u->ip, sizeof u->ip, "%.63s", text);
 }
 
-static DevKind guess_kind(const char *name)
-{
-    if (strcasestr(name, "controller") || strcasestr(name, "gamepad"))
-        return DEV_GAMEPAD;
-    if (strcasestr(name, "keyboard"))
-        return DEV_KEYBOARD;
-    if (strcasestr(name, "mouse"))
-        return DEV_MOUSE;
-    if (strcasestr(name, "buds") || strcasestr(name, "pods") ||
-        strcasestr(name, "earbud"))
-        return DEV_EARBUDS;
-    if (strcasestr(name, "head") || strcasestr(name, "wh-") ||
-        strcasestr(name, "xm"))
-        return DEV_HEADPHONES;
-    return DEV_GENERIC;
-}
-
-static int parse_device_line(char *line, char *mac, size_t macsz,
-                             char *name, size_t namesz)
-{
-    char *dev = strstr(line, "Device ");
-    if (!dev)
-        return 0;
-    dev += 7;
-    char *sp = strchr(dev, ' ');
-    if (!sp)
-        return 0;
-
-    size_t n = (size_t)(sp - dev);
-    if (n >= macsz)
-        n = macsz - 1;
-    if (macsz > 0) {
-        memcpy(mac, dev, n);
-        mac[n] = 0;
-    }
-
-    if (name && namesz > 0) {
-        char *nm = trim(sp + 1);
-        snprintf(name, namesz, "%s", nm);
-    }
-    return 1;
-}
-
-static int mac_connected(char cmacs[][24], int n, const char *mac)
-{
-    for (int i = 0; i < n; i++)
-        if (!strcmp(cmacs[i], mac))
-            return 1;
-    return 0;
-}
-
-static int bt_mac_list(const char *filter, char macs[][24], int cap)
-{
-    char cmd[128];
-    snprintf(cmd, sizeof cmd, "bluetoothctl devices %s 2>/dev/null", filter);
-    int count = 0;
-    FILE *f = popen(cmd, "r");
-    if (!f)
-        return 0;
-    char line[256];
-    while (fgets(line, sizeof line, f) && count < cap) {
-        char mac[24];
-        if (parse_device_line(line, mac, sizeof mac, NULL, 0))
-            snprintf(macs[count++], 24, "%s", mac);
-    }
-    pclose(f);
-    return count;
-}
-
-static void read_bt(Ui *u)
-{
-    char out[8192];
-    if (read_cmd("bluetoothctl show 2>/dev/null", out, sizeof out)) {
-        if (strstr(out, "Powered: yes"))
-            u->bt_on = 1;
-        else if (strstr(out, "Powered: no"))
-            u->bt_on = 0;
-
-        const char *p = strstr(out, "Alias:");
-        if (p) {
-            p += 6;
-            while (*p == ' ' || *p == '\t')
-                p++;
-            const char *e = p;
-            while (*e && *e != '\n' && *e != '\r')
-                e++;
-            size_t n = (size_t)(e - p);
-            if (n >= sizeof u->bt_name)
-                n = sizeof u->bt_name - 1;
-            memcpy(u->bt_name, p, n);
-            u->bt_name[n] = 0;
-        }
-        u->bt_discoverable = strstr(out, "Discoverable: yes") != NULL;
-    }
-
-    char cmacs[32][24];
-    int cmc = bt_mac_list("Connected", cmacs, 32);
-    char tmacs[32][24];
-    int tmc = bt_mac_list("Trusted", tmacs, 32);
-
-    BtDev tmp[MAX_BT];
-    int tc = 0;
-    int total = 0;
-    FILE *f = popen("bluetoothctl devices Paired 2>/dev/null", "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof line, f)) {
-            char mac[24];
-            char name[96];
-            if (!parse_device_line(line, mac, sizeof mac,
-                                   name, sizeof name))
-                continue;
-            total++;
-            if (tc < MAX_BT) {
-                BtDev *d = &tmp[tc++];
-                snprintf(d->name, sizeof d->name, "%s", name);
-                snprintf(d->mac, sizeof d->mac, "%s", mac);
-                d->kind = guess_kind(name);
-                d->connected = mac_connected(cmacs, cmc, mac);
-                d->trusted = mac_connected(tmacs, tmc, mac);
-            }
-        }
-        pclose(f);
-
-        /* A device that connects without going through this panel should
-         * still become trusted. Screenshot mode never mutates state. */
-        if (u->allow_mutation && u->bt_on) {
-            for (int i = 0; i < tc; i++) {
-                if (!tmp[i].connected || tmp[i].trusted)
-                    continue;
-                char cmd[160];
-                snprintf(cmd, sizeof cmd,
-                         "bluetoothctl trust %s >/dev/null 2>&1",
-                         tmp[i].mac);
-                run_async(cmd);
-                tmp[i].trusted = 1;
-            }
-        }
-
-        memcpy(u->bt, tmp, sizeof(BtDev) * (size_t)tc);
-        u->bt_count = tc;
-        u->bt_paired_total = total;
-    }
-}
-
-static void sys_refresh(Ui *u, NMClient *nm)
-{
-    read_wifi(u, nm);
-    read_ip(u, nm);
-    read_bt(u);
-}
-
-static void set_bt_radio(Ui *u, int on)
-{
-    u->bt_on = on;
-    run_async(on ? "bluetoothctl power on >/dev/null 2>&1 || "
-                   "rfkill unblock bluetooth >/dev/null 2>&1"
-                 : "bluetoothctl power off >/dev/null 2>&1 || "
-                   "rfkill block bluetooth >/dev/null 2>&1");
-}
-
 /* ------------------------------------------------------------------ */
 /*  Wayland backend                                                    */
 /* ------------------------------------------------------------------ */
@@ -2789,10 +2688,21 @@ struct App {
     int draw_h;
     double resize_settle_at;
 
-    int action_fd;
-    pid_t action_pid;
-    char action_buf[2048];
-    size_t action_len;
+    /* BlueZ integration: system-bus connection and signal subscriptions. */
+    GDBusConnection *bt_bus;
+    GCancellable *bt_cancel;
+    gulong bt_prop_sig;
+    gulong bt_om_sig;
+    gulong bt_name_sig;
+    BtOp *bt_op;            /* one in-flight Bluetooth operation */
+    int bt_pending;
+
+    /* BlueZ pairing agent and discovery scheduling. */
+    guint bt_agent_id;
+    GDBusNodeInfo *bt_agent_info;
+    GDBusMethodInvocation *bt_agent_invocation; /* held while dialog is open */
+    char bt_agent_path[128];
+    double bt_poll_at;          /* periodic refresh while scanning */
 
     int ctl_fd;
     int ctl_client_fd;
@@ -2929,6 +2839,1216 @@ static void nm_prop_cb(GObject *object, GParamSpec *pspec, gpointer user_data)
     (void)object;
     (void)pspec;
     nm_ui_refresh(user_data);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Bluetooth — BlueZ D-Bus API through GDBus                          */
+/* ------------------------------------------------------------------ */
+
+struct BtOp {
+    App *a;
+    int kind;               /* BT_ACTION_* or BT_OP_POWER */
+    char name[96];
+    char mac[24];
+    char path[128];
+    int on;
+};
+
+static void bt_ignore_cb(GObject *source, GAsyncResult *result,
+                         gpointer user_data)
+{
+    (void)user_data;
+    GError *err = NULL;
+    GVariant *reply = source ? g_dbus_connection_call_finish(
+        G_DBUS_CONNECTION(source), result, &err) : NULL;
+    if (reply)
+        g_variant_unref(reply);
+    g_clear_error(&err);
+}
+
+/* One helper for every BlueZ Properties.Set call. */
+static void bt_set_property(GDBusConnection *bus, GCancellable *cancel,
+                            const char *path, const char *iface,
+                            const char *prop, GVariant *value,
+                            GAsyncReadyCallback cb, gpointer data)
+{
+    if (!bus || !path[0]) {
+        if (cb)
+            cb(NULL, NULL, data);
+        return;
+    }
+    g_dbus_connection_call(bus, BLUEZ_SERVICE, path,
+                           BLUEZ_PROPERTIES_IFACE, "Set",
+                           g_variant_new("(ssv)", iface, prop, value),
+                           NULL, G_DBUS_CALL_FLAGS_NONE,
+                           BT_SET_TIMEOUT_MS, cancel, cb, data);
+}
+
+static void bt_trust_path(GDBusConnection *bus, GCancellable *cancel,
+                          const char *path, GAsyncReadyCallback cb,
+                          gpointer data)
+{
+    bt_set_property(bus, cancel, path, BLUEZ_DEVICE_IFACE, "Trusted",
+                    g_variant_new_boolean(TRUE),
+                    cb ? cb : bt_ignore_cb, data);
+}
+
+static DevKind guess_kind(const char *name)
+{
+    if (strcasestr(name, "controller") || strcasestr(name, "gamepad"))
+        return DEV_GAMEPAD;
+    if (strcasestr(name, "keyboard"))
+        return DEV_KEYBOARD;
+    if (strcasestr(name, "mouse"))
+        return DEV_MOUSE;
+    if (strcasestr(name, "buds") || strcasestr(name, "pods") ||
+        strcasestr(name, "earbud"))
+        return DEV_EARBUDS;
+    if (strcasestr(name, "head") || strcasestr(name, "wh-") ||
+        strcasestr(name, "xm"))
+        return DEV_HEADPHONES;
+    return DEV_GENERIC;
+}
+
+/* BlueZ reports a device's type via the Icon property.  Use it when the
+ * friendly Name is not available yet (common for freshly discovered LE
+ * devices), so rows show a readable label instead of just a MAC address. */
+static DevKind guess_kind_icon(const char *icon)
+{
+    if (!icon || !icon[0])
+        return DEV_GENERIC;
+    if (strcasestr(icon, "gaming") || strcasestr(icon, "controller"))
+        return DEV_GAMEPAD;
+    if (strcasestr(icon, "keyboard"))
+        return DEV_KEYBOARD;
+    if (strcasestr(icon, "mouse"))
+        return DEV_MOUSE;
+    if (strcasestr(icon, "headphone") || strcasestr(icon, "headset"))
+        return DEV_HEADPHONES;
+    return DEV_GENERIC;
+}
+
+/* BlueZ often fills Name/Alias with the device address itself for devices
+ * it has not resolved yet.  The formatting may differ from the Address
+ * property (upper/lower case, '-' instead of ':', no separators, or a
+ * "dev_" prefix), so an exact strcmp() against addr is not enough.  Treat
+ * any 6-octet hexadecimal string as "no friendly name available". */
+static int is_mac_like(const char *s)
+{
+    if (!s || !s[0])
+        return 0;
+    if (!g_ascii_strncasecmp(s, "dev_", 4))
+        s += 4;
+    int digits = 0;
+    int had_sep = 0;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (g_ascii_isxdigit(c)) {
+            digits++;
+            had_sep = 0;
+        } else if (c == ':' || c == '-' || c == '_') {
+            /* Separators must sit between octets, never back-to-back. */
+            if (had_sep || digits == 0 || (digits % 2) != 0)
+                return 0;
+            had_sep = 1;
+        } else {
+            return 0;
+        }
+    }
+    return digits == 12;
+}
+
+/* Pick the best human-readable name BlueZ exposes for a device.  Alias
+ * usually mirrors Name, but for unpaired devices the Name may be missing
+ * (or just be the MAC address) until services are resolved, so fall back to
+ * the icon-derived type instead of showing a MAC as the row title. */
+static const char *bt_device_name(const char *name, const char *alias,
+                                  const char *addr, const char *icon)
+{
+    (void)addr;  /* is_mac_like() recognizes every formatting variant */
+    if (name && name[0] && !is_mac_like(name))
+        return name;
+    if (alias && alias[0] && !is_mac_like(alias))
+        return alias;
+    DevKind kind = guess_kind(name ? name : "");
+    if (kind == DEV_GENERIC)
+        kind = guess_kind(alias ? alias : "");
+    if (kind == DEV_GENERIC)
+        kind = guess_kind_icon(icon);
+    if (kind != DEV_GENERIC)
+        return dev_kind_name(kind);
+    return "Nearby device";
+}
+
+/* GetManagedObjects gives us the adapter and every device in one D-Bus
+ * round trip, replacing the old bluetoothctl show/devices parsing. */
+static void read_bt(Ui *u, GDBusConnection *bus, GCancellable *cancel)
+{
+    if (!bus)
+        return;
+
+    GError *err = NULL;
+    GVariant *result = g_dbus_connection_call_sync(
+        bus, BLUEZ_SERVICE, BLUEZ_ROOT_PATH,
+        BLUEZ_OBJECT_MANAGER_IFACE, "GetManagedObjects", NULL,
+        G_VARIANT_TYPE(BLUEZ_MANAGED_OBJECTS_TYPE),
+        G_DBUS_CALL_FLAGS_NONE, BT_STATE_TIMEOUT_MS, cancel, &err);
+    if (err) {
+        g_clear_error(&err);
+        return;
+    }
+    if (!result)
+        return;
+
+    char adapter_path[128] = { 0 };
+    char alias[96] = { 0 };
+    gboolean powered = FALSE, discoverable = FALSE;
+
+    BtDev tmp[MAX_BT];
+    BtDev found[MAX_BT_FOUND];
+    memset(tmp, 0, sizeof tmp);
+    memset(found, 0, sizeof found);
+    int tc = 0;
+    int fc = 0;
+    int total = 0;
+
+    GVariantIter *objects = NULL;
+    g_variant_get(result, BLUEZ_MANAGED_OBJECTS_TYPE, &objects);
+    const char *path;
+    GVariantIter *ifaces;
+    while (g_variant_iter_next(objects, "{oa{sa{sv}}}", &path, &ifaces)) {
+        const char *iface;
+        GVariant *props;
+        while (g_variant_iter_next(ifaces, "{s@a{sv}}", &iface, &props)) {
+            if (!g_strcmp0(iface, BLUEZ_ADAPTER_IFACE)) {
+                const char *name = NULL;
+                g_variant_lookup(props, "Powered", "b", &powered);
+                g_variant_lookup(props, "Discoverable", "b", &discoverable);
+                if (g_variant_lookup(props, "Alias", "&s", &name) && name)
+                    snprintf(alias, sizeof alias, "%s", name);
+                snprintf(adapter_path, sizeof adapter_path, "%s", path);
+            } else if (!g_strcmp0(iface, BLUEZ_DEVICE_IFACE)) {
+                gboolean paired = FALSE, connected = FALSE, trusted = FALSE;
+                const char *addr = NULL, *name = NULL, *alias = NULL;
+                const char *icon = NULL;
+                g_variant_lookup(props, "Paired", "b", &paired);
+                g_variant_lookup(props, "Connected", "b", &connected);
+                g_variant_lookup(props, "Trusted", "b", &trusted);
+                g_variant_lookup(props, "Address", "&s", &addr);
+                g_variant_lookup(props, "Name", "&s", &name);
+                g_variant_lookup(props, "Alias", "&s", &alias);
+                g_variant_lookup(props, "Icon", "&s", &icon);
+                if (addr && addr[0]) {
+                    const char *shown = bt_device_name(name, alias, addr, icon);
+                    if (paired) {
+                        total++;
+                        if (tc < MAX_BT) {
+                            BtDev *d = &tmp[tc++];
+                            snprintf(d->name, sizeof d->name, "%s", shown);
+                            snprintf(d->mac, sizeof d->mac, "%s", addr);
+                            snprintf(d->path, sizeof d->path, "%s", path);
+                            d->kind = guess_kind(d->name);
+                            if (d->kind == DEV_GENERIC)
+                                d->kind = guess_kind_icon(icon);
+                            d->connected = connected ? 1 : 0;
+                            d->trusted = trusted ? 1 : 0;
+                        }
+                    } else if (u->bt_discovering && fc < MAX_BT_FOUND) {
+                        /* While discovery is active, keep the unpaired
+                         * devices BlueZ has seen so they can be offered
+                         * as PAIR rows. */
+                        BtDev *d = &found[fc++];
+                        snprintf(d->name, sizeof d->name, "%s", shown);
+                        snprintf(d->mac, sizeof d->mac, "%s", addr);
+                        snprintf(d->path, sizeof d->path, "%s", path);
+                        d->kind = guess_kind(d->name);
+                        if (d->kind == DEV_GENERIC)
+                            d->kind = guess_kind_icon(icon);
+                    }
+                }
+            }
+            g_variant_unref(props);
+        }
+        g_variant_iter_free(ifaces);
+    }
+    g_variant_iter_free(objects);
+    g_variant_unref(result);
+
+    u->bt_on = powered ? 1 : 0;
+    u->bt_discoverable = discoverable ? 1 : 0;
+    snprintf(u->bt_name, sizeof u->bt_name, "%s", alias[0] ? alias : "BlueZ");
+    snprintf(u->bt_adapter_path, sizeof u->bt_adapter_path, "%s",
+             adapter_path);
+
+    /* A device that connects without going through this panel should
+     * still become trusted. Screenshot mode never mutates state. */
+    if (u->allow_mutation && u->bt_on) {
+        for (int i = 0; i < tc; i++) {
+            if (!tmp[i].connected || tmp[i].trusted)
+                continue;
+            bt_trust_path(bus, cancel, tmp[i].path, NULL, NULL);
+            tmp[i].trusted = 1;
+        }
+    }
+
+    memcpy(u->bt, tmp, sizeof(BtDev) * (size_t)tc);
+    u->bt_count = tc;
+    u->bt_paired_total = total;
+
+    if (u->bt_discovering) {
+        memcpy(u->bt_found, found, sizeof(BtDev) * (size_t)fc);
+        u->bt_found_count = fc;
+    } else {
+        u->bt_found_count = 0;
+    }
+}
+
+static void sys_refresh(Ui *u, NMClient *nm, GDBusConnection *bus,
+                        GCancellable *cancel)
+{
+    read_wifi(u, nm);
+    read_ip(u, nm);
+    read_bt(u, bus, cancel);
+}
+
+/* BlueZ property/object signals keep the panel in sync with changes made
+ * outside it, like libnm's signals do for Wi-Fi. */
+static void bt_signal_cb(GDBusConnection *bus, const char *sender,
+                         const char *path, const char *iface,
+                         const char *signal, GVariant *params,
+                         gpointer user_data)
+{
+    (void)bus; (void)sender; (void)path; (void)iface;
+    App *a = user_data;
+    (void)signal;
+
+    if (!g_strcmp0(signal, "NameOwnerChanged") && params) {
+        const char *name = NULL, *old_owner = NULL, *new_owner = NULL;
+        g_variant_get(params, "(&s&s&s)", &name, &old_owner, &new_owner);
+        (void)name; (void)old_owner;
+        if (!new_owner || !new_owner[0]) {
+            /* BlueZ went away: fall back to the off/empty state. */
+            a->ui.bt_on = 0;
+            a->ui.bt_count = 0;
+            a->ui.bt_paired_total = 0;
+            a->ui.bt_found_count = 0;
+            a->ui.bt_discovering = 0;
+            a->bt_poll_at = 0.0;
+            a->ui.bt_adapter_path[0] = 0;
+            a->ui.bt_name[0] = 0;
+            bt_agent_cancel(a);
+            update_hover(a);
+            update_cursor(a);
+            mark_dirty(a);
+            return;
+        }
+        /* BlueZ restarted: re-register our pairing agent. */
+        bt_agent_unregister(a);
+        bt_agent_register(a);
+    }
+
+    read_bt(&a->ui, a->bt_bus, a->bt_cancel);
+    update_hover(a);
+    update_cursor(a);
+    mark_dirty(a);
+}
+
+static int bt_op_live(BtOp *op)
+{
+    return op && op->a && op->a->bt_op == op;
+}
+
+static void bt_op_detach(App *a)
+{
+    BtOp *op = a->bt_op;
+    if (!op)
+        return;
+    op->a = NULL;           /* the async callback frees the orphaned op */
+    a->bt_op = NULL;
+    if (a->bt_pending > 0)
+        a->bt_pending--;
+}
+
+static void bt_finish_op(BtOp *op, int ok, const char *detail)
+{
+    App *a = op->a;
+    Ui *u = &a->ui;
+    int kind = op->kind;
+
+    /* If pairing ended while an agent prompt was still open, dismiss it. */
+    if (u->pair_open)
+        bt_agent_cancel(a);
+
+    if (a->bt_op == op)
+        a->bt_op = NULL;
+    if (a->bt_pending > 0)
+        a->bt_pending--;
+
+    if (kind == BT_OP_POWER) {
+        if (!ok) {
+            u->bt_on = !op->on;
+            u->bt_msg_ok = 0;
+            snprintf(u->bt_msg, sizeof u->bt_msg, "Failed: %.145s",
+                     detail ? detail : "Could not change Bluetooth power.");
+            u->bt_msg_t = u->t;
+        }
+    } else if (ok) {
+        u->bt_msg_ok = 1;
+        if (kind == BT_ACTION_DISCONNECT)
+            snprintf(u->bt_msg, sizeof u->bt_msg, "Disconnected from %s",
+                     op->name);
+        else if (kind == BT_ACTION_FORGET)
+            snprintf(u->bt_msg, sizeof u->bt_msg, "Forgot %s", op->name);
+        else if (kind == BT_ACTION_PAIR)
+            snprintf(u->bt_msg, sizeof u->bt_msg, "Paired with %s", op->name);
+        else
+            snprintf(u->bt_msg, sizeof u->bt_msg,
+                     "Connected to %s · trusted", op->name);
+        u->bt_msg_t = u->t;
+    } else {
+        u->bt_msg_ok = 0;
+        snprintf(u->bt_msg, sizeof u->bt_msg, "Failed: %.145s",
+                 detail ? detail : "Could not update the device.");
+        u->bt_msg_t = u->t;
+    }
+
+    u->bt_action_kind = BT_ACTION_NONE;
+    u->bt_action_row = -1;
+    a->resync_at = mono_sec() + (ok ? 0.35 : 1.0);
+    update_hover(a);
+    update_cursor(a);
+    mark_dirty(a);
+    g_free(op);
+}
+
+static void bt_power_cb(GObject *source, GAsyncResult *result, gpointer data)
+{
+    BtOp *op = data;
+    if (!bt_op_live(op)) {
+        g_free(op);
+        return;
+    }
+    GError *err = NULL;
+    GVariant *reply = source ? g_dbus_connection_call_finish(
+        G_DBUS_CONNECTION(source), result, &err) : NULL;
+    char msg[256] = { 0 };
+    if (err)
+        snprintf(msg, sizeof msg, "%s", err->message);
+    g_clear_error(&err);
+    if (reply)
+        g_variant_unref(reply);
+    bt_finish_op(op, !msg[0], msg[0] ? msg : NULL);
+}
+
+static void bt_trust_done_cb(GObject *source, GAsyncResult *result,
+                             gpointer data)
+{
+    BtOp *op = data;
+    if (!bt_op_live(op)) {
+        g_free(op);
+        return;
+    }
+    bt_ignore_cb(source, result, NULL);
+    bt_finish_op(op, 1, NULL);
+}
+
+static void bt_action_cb(GObject *source, GAsyncResult *result, gpointer data)
+{
+    BtOp *op = data;
+    if (!bt_op_live(op)) {
+        g_free(op);
+        return;
+    }
+    GError *err = NULL;
+    GVariant *reply = source ? g_dbus_connection_call_finish(
+        G_DBUS_CONNECTION(source), result, &err) : NULL;
+    char msg[256] = { 0 };
+    if (err)
+        snprintf(msg, sizeof msg, "%s", err->message);
+    g_clear_error(&err);
+    if (reply)
+        g_variant_unref(reply);
+
+    if (!msg[0] && op->kind == BT_ACTION_PAIR) {
+        /* Pairing creates the bond; connect immediately so the device is
+         * usable without a second click.  Ignore connect failures here —
+         * the row still shows as paired and CONNECT remains available. */
+        g_dbus_connection_call(op->a->bt_bus, BLUEZ_SERVICE, op->path,
+                               BLUEZ_DEVICE_IFACE, "Connect", NULL, NULL,
+                               G_DBUS_CALL_FLAGS_NONE, BT_ACTION_TIMEOUT_MS,
+                               op->a->bt_cancel, bt_ignore_cb, NULL);
+    }
+    if (!msg[0] && (op->kind == BT_ACTION_CONNECT ||
+                    op->kind == BT_ACTION_PAIR)) {
+        /* A successful connection or pairing marks the device trusted. */
+        bt_trust_path(op->a->bt_bus, op->a->bt_cancel, op->path,
+                      bt_trust_done_cb, op);
+        return;
+    }
+    bt_finish_op(op, !msg[0], msg[0] ? msg : NULL);
+}
+
+static void bt_cancel_op(App *a)
+{
+    bt_op_detach(a);
+    if (a->bt_cancel)
+        g_cancellable_cancel(a->bt_cancel);
+    a->ui.bt_action_kind = BT_ACTION_NONE;
+    a->ui.bt_action_row = -1;
+}
+
+static void set_bt_radio(App *a, int on)
+{
+    Ui *u = &a->ui;
+    if (!a->bt_bus || !u->bt_adapter_path[0] || !u->allow_mutation) {
+        u->bt_msg_ok = 0;
+        snprintf(u->bt_msg, sizeof u->bt_msg, "Failed: Bluetooth unavailable.");
+        u->bt_msg_t = u->t;
+        mark_dirty(a);
+        return;
+    }
+    if (a->bt_op && a->bt_op->kind != BT_OP_POWER)
+        return;             /* let the current device action finish */
+
+    if (!on)
+        stop_bt_discovery(a);
+
+    bt_op_detach(a);
+    BtOp *op = g_new0(BtOp, 1);
+    op->a = a;
+    op->kind = BT_OP_POWER;
+    op->on = on;
+    a->bt_op = op;
+    a->bt_pending++;
+    u->bt_on = on;          /* optimistic, like the Wi-Fi toggle */
+    bt_set_property(a->bt_bus, a->bt_cancel, u->bt_adapter_path,
+                    BLUEZ_ADAPTER_IFACE, "Powered",
+                    g_variant_new_boolean(on), bt_power_cb, op);
+    mark_dirty(a);
+}
+
+/* ---- device discovery --------------------------------------------- */
+
+typedef struct {
+    App *a;
+    int start;
+} BtDiscoveryOp;
+
+static void bt_discovery_cb(GObject *source, GAsyncResult *result, gpointer data)
+{
+    BtDiscoveryOp *op = data;
+    App *a = op->a;
+    Ui *u = &a->ui;
+    GError *err = NULL;
+    GVariant *reply = source ? g_dbus_connection_call_finish(
+        G_DBUS_CONNECTION(source), result, &err) : NULL;
+    char msg[256] = { 0 };
+    if (err)
+        snprintf(msg, sizeof msg, "%s", err->message);
+    g_clear_error(&err);
+    if (reply)
+        g_variant_unref(reply);
+
+    if (msg[0]) {
+        u->bt_msg_ok = 0;
+        snprintf(u->bt_msg, sizeof u->bt_msg, "Failed: %.145s", msg);
+        u->bt_msg_t = u->t;
+        if (op->start) {
+            /* Roll back the optimistic discovery state. */
+            u->bt_discovering = 0;
+            u->bt_found_count = 0;
+            a->bt_poll_at = 0.0;
+        }
+        mark_dirty(a);
+    } else if (op->start) {
+        u->bt_msg_ok = 1;
+        snprintf(u->bt_msg, sizeof u->bt_msg, "Searching for devices…");
+        u->bt_msg_t = u->t;
+        mark_dirty(a);
+    }
+    g_free(op);
+}
+
+static void start_bt_discovery(App *a)
+{
+    Ui *u = &a->ui;
+    if (u->bt_discovering || !u->bt_on || !u->allow_mutation ||
+        !a->bt_bus || !u->bt_adapter_path[0])
+        return;
+
+    BtDiscoveryOp *op = g_new0(BtDiscoveryOp, 1);
+    op->a = a;
+    op->start = 1;
+
+    u->bt_discovering = 1;
+    u->bt_found_count = 0;
+    a->bt_poll_at = mono_sec() + 2.0;
+
+    /* BlueZ refuses Device1.Pair while the adapter is not pairable, and a
+     * remote device cannot complete the handshake if we are not connectable. */
+    bt_set_property(a->bt_bus, a->bt_cancel, u->bt_adapter_path,
+                    BLUEZ_ADAPTER_IFACE, "Pairable",
+                    g_variant_new_boolean(TRUE), bt_ignore_cb, NULL);
+    bt_set_property(a->bt_bus, a->bt_cancel, u->bt_adapter_path,
+                    BLUEZ_ADAPTER_IFACE, "Connectable",
+                    g_variant_new_boolean(TRUE), bt_ignore_cb, NULL);
+
+    g_dbus_connection_call(a->bt_bus, BLUEZ_SERVICE, u->bt_adapter_path,
+                           BLUEZ_ADAPTER_IFACE, "StartDiscovery", NULL, NULL,
+                           G_DBUS_CALL_FLAGS_NONE, BT_SET_TIMEOUT_MS,
+                           a->bt_cancel, bt_discovery_cb, op);
+    mark_dirty(a);
+}
+
+static void stop_bt_discovery(App *a)
+{
+    Ui *u = &a->ui;
+    if (!u->bt_discovering)
+        return;
+
+    u->bt_discovering = 0;
+    u->bt_found_count = 0;
+    a->bt_poll_at = 0.0;
+
+    if (a->bt_bus && u->bt_adapter_path[0] && u->allow_mutation) {
+        BtDiscoveryOp *op = g_new0(BtDiscoveryOp, 1);
+        op->a = a;
+        op->start = 0;
+        g_dbus_connection_call(a->bt_bus, BLUEZ_SERVICE, u->bt_adapter_path,
+                               BLUEZ_ADAPTER_IFACE, "StopDiscovery", NULL, NULL,
+                               G_DBUS_CALL_FLAGS_NONE, BT_SET_TIMEOUT_MS,
+                               a->bt_cancel, bt_discovery_cb, op);
+    }
+    mark_dirty(a);
+}
+
+/* shut-down path: cancel the generic cancellable only after StopDiscovery
+ * has actually been delivered, otherwise the pending async call is dropped
+ * and BlueZ keeps scanning after the panel exits. */
+static void stop_bt_discovery_sync(App *a)
+{
+    Ui *u = &a->ui;
+    if (!u->bt_discovering)
+        return;
+
+    if (a->bt_bus && u->bt_adapter_path[0] && u->allow_mutation) {
+        GError *err = NULL;
+        GVariant *reply = g_dbus_connection_call_sync(
+            a->bt_bus, BLUEZ_SERVICE, u->bt_adapter_path,
+            BLUEZ_ADAPTER_IFACE, "StopDiscovery", NULL, NULL,
+            G_DBUS_CALL_FLAGS_NONE, BT_STOP_TIMEOUT_MS, NULL, &err);
+        if (reply)
+            g_variant_unref(reply);
+        g_clear_error(&err);
+    }
+    u->bt_discovering = 0;
+    u->bt_found_count = 0;
+    a->bt_poll_at = 0.0;
+}
+
+static void toggle_bt_discovery(App *a)
+{
+    if (a->ui.bt_discovering)
+        stop_bt_discovery(a);
+    else
+        start_bt_discovery(a);
+}
+
+static void start_bt_action(App *a, int kind, int row)
+{
+    Ui *u = &a->ui;
+    int total = u->bt_count + u->bt_found_count;
+    if (!u->bt_on || u->connect_open || u->connect_busy || u->pair_open ||
+        u->wifi_action_kind != WIFI_ACTION_NONE ||
+        a->bt_op || row < 0 || row >= total)
+        return;
+
+    int found = row >= u->bt_count;
+    BtDev *d = found ? &u->bt_found[row - u->bt_count] : &u->bt[row];
+    if (!a->bt_bus || !d->path[0]) {
+        u->bt_msg_ok = 0;
+        snprintf(u->bt_msg, sizeof u->bt_msg, "Failed: Bluetooth unavailable.");
+        u->bt_msg_t = u->t;
+        update_hover(a);
+        update_cursor(a);
+        mark_dirty(a);
+        return;
+    }
+
+    BtOp *op = g_new0(BtOp, 1);
+    op->a = a;
+    op->kind = kind;
+    snprintf(op->name, sizeof op->name, "%s", d->name);
+    snprintf(op->mac, sizeof op->mac, "%s", d->mac);
+    snprintf(op->path, sizeof op->path, "%s", d->path);
+    a->bt_op = op;
+    a->bt_pending++;
+    u->bt_action_kind = kind;
+    u->bt_action_row = row;
+    u->bt_msg[0] = 0;
+    mark_dirty(a);
+
+    if (kind == BT_ACTION_FORGET) {
+        /* RemoveDevice is an Adapter1 method on the adapter object, not an
+         * ObjectManager method on the root object. */
+        g_dbus_connection_call(a->bt_bus, BLUEZ_SERVICE, u->bt_adapter_path,
+                               BLUEZ_ADAPTER_IFACE, "RemoveDevice",
+                               g_variant_new("(o)", op->path), NULL,
+                               G_DBUS_CALL_FLAGS_NONE, BT_ACTION_TIMEOUT_MS,
+                               a->bt_cancel, bt_action_cb, op);
+    } else {
+        const char *method = "Connect";
+        int timeout = BT_ACTION_TIMEOUT_MS;
+        if (kind == BT_ACTION_DISCONNECT)
+            method = "Disconnect";
+        else if (kind == BT_ACTION_PAIR) {
+            method = "Pair";
+            /* Pairing waits on the agent dialog, so allow plenty of time. */
+            timeout = BT_PAIR_TIMEOUT_MS;
+        }
+        g_dbus_connection_call(a->bt_bus, BLUEZ_SERVICE, op->path,
+                               BLUEZ_DEVICE_IFACE, method,
+                               NULL, NULL, G_DBUS_CALL_FLAGS_NONE,
+                               timeout, a->bt_cancel,
+                               bt_action_cb, op);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  BlueZ pairing agent and its dialog                                 */
+/* ------------------------------------------------------------------ */
+
+static const char *find_bt_name(Ui *u, const char *path)
+{
+    if (!path)
+        return NULL;
+    for (int i = 0; i < u->bt_count; i++)
+        if (!strcmp(u->bt[i].path, path))
+            return u->bt[i].name;
+    for (int i = 0; i < u->bt_found_count; i++)
+        if (!strcmp(u->bt_found[i].path, path))
+            return u->bt_found[i].name;
+    return NULL;
+}
+
+static const char *pair_prompt(PairModalKind kind)
+{
+    switch (kind) {
+    case PAIR_MODAL_PIN:             return "Enter the PIN shown on the device.";
+    case PAIR_MODAL_PASSKEY:         return "Enter the passkey shown on the device.";
+    case PAIR_MODAL_CONFIRM:         return "Confirm this code matches the device.";
+    case PAIR_MODAL_DISPLAY_PIN:     return "Enter this PIN on the device.";
+    case PAIR_MODAL_DISPLAY_PASSKEY: return "Enter this passkey on the device.";
+    case PAIR_MODAL_AUTHORIZE:       return "Allow this device to pair?";
+    default:                         return "";
+    }
+}
+
+static const char *pair_button_label(PairModalKind kind)
+{
+    if (kind == PAIR_MODAL_PIN || kind == PAIR_MODAL_PASSKEY)
+        return "PAIR";
+    if (kind == PAIR_MODAL_DISPLAY_PIN || kind == PAIR_MODAL_DISPLAY_PASSKEY)
+        return "OK";
+    return "CONFIRM";
+}
+
+static int pair_wants_entry(PairModalKind kind)
+{
+    return kind == PAIR_MODAL_PIN || kind == PAIR_MODAL_PASSKEY;
+}
+
+static void pair_modal_clear(Ui *u)
+{
+    u->pair_open = 0;
+    u->pair_kind = PAIR_MODAL_NONE;
+    u->pair_device[0] = 0;
+    u->pair_code[0] = 0;
+    u->pair_entry[0] = 0;
+    u->pair_msg[0] = 0;
+    u->hover_pair_field = 0;
+    u->hover_pair_cancel = 0;
+    u->hover_pair_confirm = 0;
+}
+
+static void pair_modal_open(App *a, PairModalKind kind,
+                            const char *path, const char *code)
+{
+    Ui *u = &a->ui;
+    if (u->pair_open)
+        return;
+    const char *name = find_bt_name(u, path);
+    u->pair_open = 1;
+    u->pair_kind = kind;
+    snprintf(u->pair_device, sizeof u->pair_device, "%s",
+             (name && name[0]) ? name : "Bluetooth device");
+    snprintf(u->pair_code, sizeof u->pair_code, "%s", code ? code : "");
+    u->pair_entry[0] = 0;
+    u->pair_msg[0] = 0;
+    u->pair_caret_t = u->t;
+    update_hover(a);
+    update_cursor(a);
+    mark_dirty(a);
+}
+
+static void paint_pair_modal(cairo_t *cr, Ui *u)
+{
+    if (!u->pair_open)
+        return;
+
+    /* Dim the panel so the dialog reads as a modal layer. */
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.62);
+    cairo_paint(cr);
+
+    double x = MODAL_X;
+    double y = MODAL_Y;
+    double w = MODAL_W;
+    double h = MODAL_H;
+
+    rounded_rect(cr, x + 4.0, y + 10.0, w, h, 15.0);
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.55);
+    cairo_fill(cr);
+
+    rounded_rect(cr, x, y, w, h, 15.0);
+    rgba(cr, C_CARD_HI, 0.99);
+    cairo_fill_preserve(cr);
+    rounded_rect(cr, x, y, w, h, 15.0);
+    cairo_set_line_width(cr, 1.0);
+    rgba(cr, C_BORDER, 0.72);
+    cairo_stroke(cr);
+
+    line(cr, x + 22.0, y + 0.5, x + w - 22.0, y + 0.5,
+         1.2, C_ACCENT, 0.55);
+
+    text_draw(cr, "BLUETOOTH PAIRING", 7.8, 600, C_ACCENT, 0.86,
+              x + MODAL_PAD, y + 20.0, ALIGN_LEFT, 1.8);
+
+    cairo_save(cr);
+    cairo_rectangle(cr, x + MODAL_PAD, y + 34.0,
+                    w - MODAL_PAD * 2.0, 24.0);
+    cairo_clip(cr);
+    text_draw(cr, u->pair_device, 15.0, 600, C_FG, 0.97,
+              x + MODAL_PAD, y + 37.0, ALIGN_LEFT, 0.0);
+    cairo_restore(cr);
+
+    text_draw(cr, pair_prompt(u->pair_kind), 8.3, 400, C_DIM, 0.68,
+              x + MODAL_PAD, y + 63.0, ALIGN_LEFT, 0.2);
+
+    double fx = x + MODAL_PAD;
+    double fy = MODAL_FIELD_Y;
+    double fw = w - MODAL_PAD * 2.0;
+    double fh = MODAL_FIELD_H;
+
+    rounded_rect(cr, fx, fy, fw, fh, 9.0);
+    rgba(cr, C_TRACK, 0.92);
+    cairo_fill_preserve(cr);
+    rounded_rect(cr, fx, fy, fw, fh, 9.0);
+    cairo_set_line_width(cr, 1.0);
+    rgba(cr, u->hover_pair_field || pair_wants_entry(u->pair_kind) ?
+         C_ACCENT : C_BORDER, u->hover_pair_field ? 0.62 : 0.46);
+    cairo_stroke(cr);
+
+    cairo_save(cr);
+    cairo_rectangle(cr, fx + 2.0, fy + 2.0, fw - 4.0, fh - 4.0);
+    cairo_clip(cr);
+    if (pair_wants_entry(u->pair_kind)) {
+        if (u->pair_entry[0]) {
+            char masked[128];
+            connect_password_mask(u->pair_entry, masked, sizeof masked);
+            text_draw(cr, masked, 10.5, 500, C_FG, 0.88,
+                      fx + 14.0, fy + 12.0, ALIGN_LEFT, 0.35);
+        } else {
+            text_draw(cr, u->pair_kind == PAIR_MODAL_PASSKEY ?
+                      "Passkey" : "PIN", 9.6, 400, C_FAINT, 0.58,
+                      fx + 18.0, fy + 13.0, ALIGN_LEFT, 0.12);
+        }
+    } else {
+        text_draw(cr, u->pair_code[0] ? u->pair_code : "—",
+                  18.0, 600, C_ACCENT, 0.95,
+                  fx + fw / 2.0, fy + 7.0, ALIGN_CENTER, 2.4);
+    }
+    cairo_restore(cr);
+
+    if (u->pair_msg[0])
+        text_draw(cr, u->pair_msg, 7.9, 500, C_RED, 0.78,
+                  x + MODAL_PAD, y + 151.0, ALIGN_LEFT, 0.15);
+
+    double by = MODAL_BTN_Y;
+    double bh = MODAL_BTN_H;
+    double bw = MODAL_BTN_W;
+    double bx2 = x + w - MODAL_PAD - bw;
+
+    rounded_rect(cr, x + MODAL_PAD, by, bw, bh, 8.0);
+    rgba(cr, u->hover_pair_cancel ? C_CARD_HI : C_CARD, 0.95);
+    cairo_fill_preserve(cr);
+    rounded_rect(cr, x + MODAL_PAD, by, bw, bh, 8.0);
+    cairo_set_line_width(cr, 1.0);
+    rgba(cr, C_BORDER, 0.52);
+    cairo_stroke(cr);
+    text_draw(cr, "CANCEL", 8.2, 600, C_DIM, 0.86,
+              x + MODAL_PAD + bw / 2.0, by + 13.0, ALIGN_CENTER, 1.3);
+
+    rounded_rect(cr, bx2, by, bw, bh, 8.0);
+    rgba(cr, u->hover_pair_confirm ? C_ACCENT_HI : C_ACCENT, 0.94);
+    cairo_fill_preserve(cr);
+    rounded_rect(cr, bx2, by, bw, bh, 8.0);
+    cairo_set_line_width(cr, 1.0);
+    rgba(cr, C_ACCENT, 0.72);
+    cairo_stroke(cr);
+    text_draw(cr, pair_button_label(u->pair_kind), 8.2, 600, C_ON_ACCENT, 0.96,
+              bx2 + bw / 2.0, by + 13.0, ALIGN_CENTER, 1.3);
+
+    text_draw(cr, "ENTER confirms · ESC cancels", 7.3, 500,
+              C_FAINT, 0.48, x + w / 2.0, y + h - 19.0,
+              ALIGN_CENTER, 0.35);
+}
+
+static void paint_pair_caret(cairo_t *cr, Ui *u)
+{
+    if (!u->pair_open || !pair_wants_entry(u->pair_kind))
+        return;
+
+    double phase = fmod(u->t - u->pair_caret_t, 1.06);
+    if (phase < 0.0)
+        phase += 1.06;
+    if (phase >= 0.53)
+        return;
+
+    double fx = MODAL_X + MODAL_PAD;
+    double fy = MODAL_FIELD_Y;
+    double fw = MODAL_W - MODAL_PAD * 2.0;
+    double fh = MODAL_FIELD_H;
+    double text_x = fx + 14.0;
+
+    double width = 0.0;
+    if (u->pair_entry[0]) {
+        char masked[128];
+        connect_password_mask(u->pair_entry, masked, sizeof masked);
+        width = text_width(cr, masked, 10.5, 500, 0.35);
+    }
+
+    double cx = text_x + (width > 0.0 ? width + 2.0 : 0.0);
+    double max_x = fx + fw - 10.0;
+    if (cx > max_x) cx = max_x;
+    if (cx < text_x) cx = text_x;
+
+    cairo_save(cr);
+    cairo_rectangle(cr, fx + 2.0, fy + 2.0, fw - 4.0, fh - 4.0);
+    cairo_clip(cr);
+    line(cr, cx, fy + 13.0, cx, fy + 31.0, 1.4, C_ACCENT_HI, 0.95);
+    cairo_restore(cr);
+}
+
+/* ---- pairing agent replies ---------------------------------------- */
+
+static void bt_agent_cancel(App *a)
+{
+    Ui *u = &a->ui;
+    if (a->bt_agent_invocation) {
+        g_dbus_method_invocation_return_dbus_error(
+            a->bt_agent_invocation, "org.bluez.Error.Canceled",
+            "Pairing canceled");
+        a->bt_agent_invocation = NULL;
+    }
+    if (u->pair_open) {
+        pair_modal_clear(u);
+        update_hover(a);
+        update_cursor(a);
+        mark_dirty(a);
+    }
+}
+
+static void bt_agent_submit(App *a)
+{
+    Ui *u = &a->ui;
+    GDBusMethodInvocation *inv = a->bt_agent_invocation;
+    if (!inv || !u->pair_open)
+        return;
+    PairModalKind kind = u->pair_kind;
+
+    if (pair_wants_entry(kind) && !u->pair_entry[0]) {
+        snprintf(u->pair_msg, sizeof u->pair_msg, "Enter a code first.");
+        mark_dirty(a);
+        return;
+    }
+
+    if (kind == PAIR_MODAL_PIN) {
+        g_dbus_method_invocation_return_value(
+            inv, g_variant_new("(s)", u->pair_entry));
+    } else if (kind == PAIR_MODAL_PASSKEY) {
+        guint32 passkey = (guint32)g_ascii_strtoull(u->pair_entry, NULL, 10);
+        g_dbus_method_invocation_return_value(
+            inv, g_variant_new("(u)", passkey));
+    } else {
+        g_dbus_method_invocation_return_value(inv, NULL);
+    }
+
+    a->bt_agent_invocation = NULL;
+    pair_modal_clear(u);
+    update_hover(a);
+    update_cursor(a);
+    mark_dirty(a);
+}
+
+/* ---- pairing dialog hit tests ------------------------------------- */
+
+static int hit_pair_card(double x, double y)
+{
+    return x >= MODAL_X && x <= MODAL_X + MODAL_W &&
+           y >= MODAL_Y && y <= MODAL_Y + MODAL_H;
+}
+
+static int hit_pair_field(App *a, double x, double y)
+{
+    return a->ui.pair_open && pair_wants_entry(a->ui.pair_kind) &&
+           x >= MODAL_X + MODAL_PAD &&
+           x <= MODAL_X + MODAL_W - MODAL_PAD &&
+           y >= MODAL_FIELD_Y && y <= MODAL_FIELD_Y + MODAL_FIELD_H;
+}
+
+static int hit_pair_cancel(App *a, double x, double y)
+{
+    return a->ui.pair_open &&
+           x >= MODAL_X + MODAL_PAD &&
+           x <= MODAL_X + MODAL_PAD + MODAL_BTN_W &&
+           y >= MODAL_BTN_Y && y <= MODAL_BTN_Y + MODAL_BTN_H;
+}
+
+static int hit_pair_confirm(App *a, double x, double y)
+{
+    double bx = MODAL_X + MODAL_W - MODAL_PAD - MODAL_BTN_W;
+    return a->ui.pair_open &&
+           x >= bx && x <= bx + MODAL_BTN_W &&
+           y >= MODAL_BTN_Y && y <= MODAL_BTN_Y + MODAL_BTN_H;
+}
+
+static void pair_modal_key(App *a, uint32_t key)
+{
+    Ui *u = &a->ui;
+    xkb_keysym_t sym = xkb_state_key_get_one_sym(a->xkb_state, key + 8);
+
+    if (sym == XKB_KEY_Escape) {
+        bt_agent_cancel(a);
+        return;
+    }
+    if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+        bt_agent_submit(a);
+        return;
+    }
+    if (!pair_wants_entry(u->pair_kind))
+        return;
+
+    if (sym == XKB_KEY_BackSpace) {
+        size_t len = strlen(u->pair_entry);
+        if (len > 0) {
+            size_t n = len - 1;
+            while (n > 0 && ((unsigned char)u->pair_entry[n] & 0xC0) == 0x80)
+                n--;
+            u->pair_entry[n] = 0;
+            u->pair_msg[0] = 0;
+            u->pair_caret_t = u->t;
+            mark_dirty(a);
+        }
+        return;
+    }
+
+    char buf[16];
+    int n = xkb_state_key_get_utf8(a->xkb_state, key + 8, buf, sizeof buf);
+    if (n <= 0)
+        return;
+
+    size_t len = strlen(u->pair_entry);
+    size_t room = sizeof u->pair_entry - len - 1;
+    if (room == 0)
+        return;
+
+    size_t add = 0;
+    for (int i = 0; i < n && add < room; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c < 0x20 || c == 0x7f)
+            continue;
+        if (u->pair_kind == PAIR_MODAL_PASSKEY && !g_ascii_isdigit(c))
+            continue;
+        u->pair_entry[len + add++] = (char)c;
+    }
+    if (add > 0) {
+        u->pair_entry[len + add] = 0;
+        u->pair_msg[0] = 0;
+        u->pair_caret_t = u->t;
+        mark_dirty(a);
+    }
+}
+
+/* ---- org.bluez.Agent1 --------------------------------------------- */
+
+static const char bt_agent_xml[] =
+    "<node>"
+    "  <interface name='org.bluez.Agent1'>"
+    "    <method name='Release'/>"
+    "    <method name='RequestPinCode'>"
+    "      <arg name='device' type='o' direction='in'/>"
+    "      <arg name='pincode' type='s' direction='out'/>"
+    "    </method>"
+    "    <method name='DisplayPinCode'>"
+    "      <arg name='device' type='o' direction='in'/>"
+    "      <arg name='pincode' type='s' direction='in'/>"
+    "    </method>"
+    "    <method name='RequestPasskey'>"
+    "      <arg name='device' type='o' direction='in'/>"
+    "      <arg name='passkey' type='u' direction='out'/>"
+    "    </method>"
+    "    <method name='DisplayPasskey'>"
+    "      <arg name='device' type='o' direction='in'/>"
+    "      <arg name='passkey' type='u' direction='in'/>"
+    "      <arg name='entered' type='u' direction='in'/>"
+    "    </method>"
+    "    <method name='RequestConfirmation'>"
+    "      <arg name='device' type='o' direction='in'/>"
+    "      <arg name='passkey' type='u' direction='in'/>"
+    "    </method>"
+    "    <method name='RequestAuthorization'>"
+    "      <arg name='device' type='o' direction='in'/>"
+    "    </method>"
+    "    <method name='AuthorizeService'>"
+    "      <arg name='device' type='o' direction='in'/>"
+    "      <arg name='uuid' type='s' direction='in'/>"
+    "    </method>"
+    "    <method name='Cancel'/>"
+    "  </interface>"
+    "</node>";
+
+static void bt_agent_method_call(GDBusConnection *connection,
+                                 const gchar *sender, const gchar *object_path,
+                                 const gchar *interface_name,
+                                 const gchar *method_name, GVariant *params,
+                                 GDBusMethodInvocation *invocation,
+                                 gpointer user_data)
+{
+    (void)connection; (void)sender; (void)object_path; (void)interface_name;
+    App *a = user_data;
+    PairModalKind kind = PAIR_MODAL_NONE;
+    gchar *path = NULL;
+    const gchar *code = NULL;
+    guint32 passkey = 0, entered = 0;
+    char codebuf[32] = { 0 };
+
+    if (!g_strcmp0(method_name, "Cancel")) {
+        bt_agent_cancel(a);
+        g_dbus_method_invocation_return_value(invocation, NULL);
+        return;
+    }
+    if (!g_strcmp0(method_name, "Release")) {
+        g_dbus_method_invocation_return_value(invocation, NULL);
+        return;
+    }
+    if (a->bt_agent_invocation) {
+        g_dbus_method_invocation_return_dbus_error(
+            invocation, "org.bluez.Error.InProgress",
+            "Another pairing request is pending");
+        return;
+    }
+
+    if (!g_strcmp0(method_name, "RequestPinCode")) {
+        g_variant_get(params, "(o)", &path);
+        kind = PAIR_MODAL_PIN;
+    } else if (!g_strcmp0(method_name, "DisplayPinCode")) {
+        g_variant_get(params, "(o&s)", &path, &code);
+        kind = PAIR_MODAL_DISPLAY_PIN;
+    } else if (!g_strcmp0(method_name, "RequestPasskey")) {
+        g_variant_get(params, "(o)", &path);
+        kind = PAIR_MODAL_PASSKEY;
+    } else if (!g_strcmp0(method_name, "DisplayPasskey")) {
+        g_variant_get(params, "(ouu)", &path, &passkey, &entered);
+        snprintf(codebuf, sizeof codebuf, "%06u", passkey);
+        code = codebuf;
+        kind = PAIR_MODAL_DISPLAY_PASSKEY;
+    } else if (!g_strcmp0(method_name, "RequestConfirmation")) {
+        g_variant_get(params, "(ou)", &path, &passkey);
+        snprintf(codebuf, sizeof codebuf, "%06u", passkey);
+        code = codebuf;
+        kind = PAIR_MODAL_CONFIRM;
+    } else if (!g_strcmp0(method_name, "RequestAuthorization")) {
+        g_variant_get(params, "(o)", &path);
+        kind = PAIR_MODAL_AUTHORIZE;
+    } else if (!g_strcmp0(method_name, "AuthorizeService")) {
+        g_variant_get(params, "(o&s)", &path, &code);
+        kind = PAIR_MODAL_AUTHORIZE;
+    } else {
+        g_dbus_method_invocation_return_error(
+            invocation, G_DBUS_ERROR, G_DBUS_ERROR_UNKNOWN_METHOD,
+            "Unknown agent method");
+        g_free(path);
+        return;
+    }
+    (void)entered;
+
+    a->bt_agent_invocation = invocation;
+    snprintf(a->bt_agent_path, sizeof a->bt_agent_path, "%s",
+             path ? path : "");
+    pair_modal_open(a, kind, path, code);
+    g_free(path);
+}
+
+static const GDBusInterfaceVTable bt_agent_vtable = {
+    .method_call = bt_agent_method_call,
+};
+
+static void bt_agent_register(App *a)
+{
+    GError *err = NULL;
+
+    if (!a->bt_bus || !a->ui.allow_mutation || a->bt_agent_id)
+        return;
+
+    a->bt_agent_info = g_dbus_node_info_new_for_xml(bt_agent_xml, &err);
+    if (!a->bt_agent_info) {
+        fprintf(stderr, "jtnetworks: agent introspection: %s\n",
+                err ? err->message : "unknown error");
+        g_clear_error(&err);
+        return;
+    }
+
+    a->bt_agent_id = g_dbus_connection_register_object(
+        a->bt_bus, BLUEZ_AGENT_PATH, a->bt_agent_info->interfaces[0],
+        &bt_agent_vtable, a, NULL, &err);
+    if (!a->bt_agent_id) {
+        fprintf(stderr, "jtnetworks: cannot register pairing agent: %s\n",
+                err ? err->message : "unknown error");
+        g_clear_error(&err);
+        g_dbus_node_info_unref(a->bt_agent_info);
+        a->bt_agent_info = NULL;
+        return;
+    }
+
+    g_dbus_connection_call(a->bt_bus, BLUEZ_SERVICE, BLUEZ_ROOT_PATH,
+                           BLUEZ_AGENT_MANAGER_IFACE, "RegisterAgent",
+                           g_variant_new("(os)", BLUEZ_AGENT_PATH,
+                                         "KeyboardDisplay"),
+                           NULL, G_DBUS_CALL_FLAGS_NONE, BT_SET_TIMEOUT_MS,
+                           a->bt_cancel, bt_ignore_cb, NULL);
+    g_dbus_connection_call(a->bt_bus, BLUEZ_SERVICE, BLUEZ_ROOT_PATH,
+                           BLUEZ_AGENT_MANAGER_IFACE, "RequestDefaultAgent",
+                           g_variant_new("(o)", BLUEZ_AGENT_PATH),
+                           NULL, G_DBUS_CALL_FLAGS_NONE, BT_SET_TIMEOUT_MS,
+                           a->bt_cancel, bt_ignore_cb, NULL);
+}
+
+static void bt_agent_unregister(App *a)
+{
+    bt_agent_cancel(a);
+    if (a->bt_agent_id && a->bt_bus) {
+        g_dbus_connection_unregister_object(a->bt_bus, a->bt_agent_id);
+        a->bt_agent_id = 0;
+        g_dbus_connection_call(a->bt_bus, BLUEZ_SERVICE, BLUEZ_ROOT_PATH,
+                               BLUEZ_AGENT_MANAGER_IFACE, "UnregisterAgent",
+                               g_variant_new("(o)", BLUEZ_AGENT_PATH),
+                               NULL, G_DBUS_CALL_FLAGS_NONE,
+                               BT_SET_TIMEOUT_MS, NULL, bt_ignore_cb, NULL);
+    }
+    if (a->bt_agent_info) {
+        g_dbus_node_info_unref(a->bt_agent_info);
+        a->bt_agent_info = NULL;
+    }
 }
 
 static int create_anon_file(size_t size)
@@ -3177,6 +4297,7 @@ static int app_draw(App *a, int use_cache)
         cairo_rectangle(cr, 0.0, 0.0, WIN_W, WIN_H);
         cairo_clip(cr);
         paint_connect_caret(cr, &a->ui);
+        paint_pair_caret(cr, &a->ui);
         cairo_restore(cr);
     }
 
@@ -3564,115 +4685,6 @@ static void start_wifi_connect(App *a)
     mark_dirty(a);
 }
 
-static void cancel_action(App *a)
-{
-    if (a->action_fd >= 0) {
-        close(a->action_fd);
-        a->action_fd = -1;
-    }
-    if (a->action_pid > 0) {
-        kill(a->action_pid, SIGTERM);
-        waitpid(a->action_pid, NULL, 0);
-        a->action_pid = -1;
-    }
-    a->action_len = 0;
-    a->ui.wifi_action_kind = WIFI_ACTION_NONE;
-    a->ui.wifi_action_row = -1;
-    a->ui.bt_action_kind = BT_ACTION_NONE;
-    a->ui.bt_action_row = -1;
-}
-
-static void finish_action(App *a)
-{
-    if (a->action_fd < 0 && a->action_pid <= 0)
-        return;
-
-    if (a->action_fd >= 0) {
-        close(a->action_fd);
-        a->action_fd = -1;
-    }
-
-    int status = 0;
-    if (a->action_pid > 0) {
-        waitpid(a->action_pid, &status, 0);
-        a->action_pid = -1;
-    }
-
-    a->action_buf[a->action_len] = 0;
-    a->action_len = 0;
-
-    Ui *u = &a->ui;
-    int kind = u->bt_action_kind;
-    char name[96];
-    char mac[24];
-    snprintf(name, sizeof name, "%s", u->bt_action_name);
-    snprintf(mac, sizeof mac, "%s", u->bt_action_mac);
-
-    u->bt_action_kind = BT_ACTION_NONE;
-    u->bt_action_row = -1;
-
-    int output_failed =
-        strstr(a->action_buf, "Failed") != NULL ||
-        strstr(a->action_buf, "not available") != NULL;
-    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
-             !output_failed;
-    if (ok) {
-        if (kind == BT_ACTION_CONNECT && mac[0]) {
-            char cmd[160];
-            snprintf(cmd, sizeof cmd,
-                     "bluetoothctl trust %s >/dev/null 2>&1", mac);
-            run_async(cmd);
-        }
-        u->bt_msg_ok = 1;
-        if (kind == BT_ACTION_DISCONNECT)
-            snprintf(u->bt_msg, sizeof u->bt_msg,
-                     "Disconnected from %s", name);
-        else if (kind == BT_ACTION_FORGET)
-            snprintf(u->bt_msg, sizeof u->bt_msg,
-                     "Forgot %s", name);
-        else
-            snprintf(u->bt_msg, sizeof u->bt_msg,
-                     "Connected to %s · trusted", name);
-    } else {
-        char *msg = a->action_buf;
-        char *err = strstr(msg, "Error:");
-        char *failed = strstr(msg, "Failed");
-        if (err)
-            msg = err + 6;
-        else if (failed)
-            msg = failed;
-        while (*msg == ' ' || *msg == '\t')
-            msg++;
-        char *nl = strpbrk(msg, "\r\n");
-        if (nl)
-            *nl = 0;
-        if (!strncmp(msg, "Failed: ", 8))
-            msg += 8;
-        else if (!strncmp(msg, "Failed to ", 10))
-            msg += 10;
-        if (!msg[0]) {
-            if (kind == BT_ACTION_CONNECT)
-                msg = "Could not connect to the device.";
-            else if (kind == BT_ACTION_DISCONNECT)
-                msg = "Could not disconnect the device.";
-            else if (kind == BT_ACTION_FORGET)
-                msg = "Could not forget the device.";
-            else
-                msg = "Could not update the device.";
-        }
-        u->bt_msg_ok = 0;
-        snprintf(u->bt_msg, sizeof u->bt_msg,
-                 "Failed: %.145s", msg);
-    }
-
-    u->bt_msg_t = u->t;
-    a->resync_at = mono_sec() + (ok ? 0.35 : 1.0);
-
-    update_hover(a);
-    update_cursor(a);
-    mark_dirty(a);
-}
-
 typedef struct {
     App *a;
     int kind;
@@ -3838,7 +4850,7 @@ static void start_wifi_action(App *a, int kind, int row)
     Ui *u = &a->ui;
     if (!u->wifi_on || !a->nm || u->connect_open || u->connect_busy ||
         u->wifi_action_kind != WIFI_ACTION_NONE ||
-        a->action_fd >= 0 || a->action_pid > 0 ||
+        a->bt_op != NULL ||
         row < 0 || row >= u->net_count)
         return;
 
@@ -3927,75 +4939,6 @@ static void start_wifi_action(App *a, int kind, int row)
     nm_client_activate_connection_async(
         a->nm, NM_CONNECTION(rc), dev, specific,
         a->net_cancel, wifi_activate_cb, op);
-}
-
-static void start_bt_action(App *a, int kind, int row)
-{
-    Ui *u = &a->ui;
-    if (!u->bt_on || u->connect_open || u->connect_busy ||
-        u->wifi_action_kind != WIFI_ACTION_NONE ||
-        a->action_fd >= 0 || a->action_pid > 0 ||
-        row < 0 || row >= u->bt_count)
-        return;
-
-    BtDev *d = &u->bt[row];
-    const char *verb;
-    if (kind == BT_ACTION_DISCONNECT)
-        verb = "disconnect";
-    else if (kind == BT_ACTION_FORGET)
-        verb = "remove";
-    else
-        verb = "connect";
-
-    int p[2];
-    if (pipe(p) < 0) {
-        u->bt_msg_ok = 0;
-        snprintf(u->bt_msg, sizeof u->bt_msg,
-                 "Failed: cannot start bluetoothctl.");
-        u->bt_msg_t = u->t;
-        mark_dirty(a);
-        return;
-    }
-    fcntl(p[0], F_SETFL, O_NONBLOCK);
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(p[0]);
-        dup2(p[1], STDOUT_FILENO);
-        dup2(p[1], STDERR_FILENO);
-        close(p[1]);
-
-        char *args[4];
-        args[0] = "bluetoothctl";
-        args[1] = (char *)verb;
-        args[2] = d->mac;
-        args[3] = NULL;
-        execvp("bluetoothctl", args);
-        _exit(127);
-    }
-
-    close(p[1]);
-    if (pid < 0) {
-        close(p[0]);
-        u->bt_msg_ok = 0;
-        snprintf(u->bt_msg, sizeof u->bt_msg,
-                 "Failed: cannot start bluetoothctl.");
-        u->bt_msg_t = u->t;
-        mark_dirty(a);
-        return;
-    }
-
-    a->action_fd = p[0];
-    a->action_pid = pid;
-    a->action_len = 0;
-    u->bt_action_kind = kind;
-    u->bt_action_row = row;
-    snprintf(u->bt_action_name, sizeof u->bt_action_name,
-             "%s", d->name);
-    snprintf(u->bt_action_mac, sizeof u->bt_action_mac,
-             "%s", d->mac);
-    u->bt_msg[0] = 0;
-    mark_dirty(a);
 }
 
 /* ---- protocol listeners ------------------------------------------ */
@@ -4209,7 +5152,8 @@ static int hit_enable(App *a, double x, double y)
 static int hit_row(App *a, double x, double y)
 {
     int on = (a->ui.tab == TAB_WIFI) ? a->ui.wifi_on : a->ui.bt_on;
-    int count = (a->ui.tab == TAB_WIFI) ? a->ui.net_count : a->ui.bt_count;
+    int count = (a->ui.tab == TAB_WIFI) ? a->ui.net_count :
+                (a->ui.bt_count + a->ui.bt_found_count);
     if (!on || count <= 0)
         return -1;
     if (x < CONTENT_X || x > CONTENT_X + CONTENT_W)
@@ -4257,11 +5201,19 @@ static int hit_row_action(const Ui *u, int row, double x, double y)
                 return WIFI_ACTION_FORGET;
         }
     } else {
-        if (row >= u->bt_count)
-            return WIFI_ACTION_NONE;
         if (u->bt_action_kind != BT_ACTION_NONE &&
             u->bt_action_row == row)
             return WIFI_ACTION_NONE;
+
+        if (row >= u->bt_count) {
+            /* Discovered (unpaired) rows only offer PAIR. */
+            if (row >= u->bt_count + u->bt_found_count)
+                return WIFI_ACTION_NONE;
+            row_action_rect(BT_ACTION_PAIR, right, ay, &ax, &aw);
+            if (x >= ax && x <= ax + aw)
+                return BT_ACTION_PAIR;
+            return WIFI_ACTION_NONE;
+        }
 
         const BtDev *d = &u->bt[row];
         int main_kind = d->connected ? BT_ACTION_DISCONNECT :
@@ -4336,6 +5288,21 @@ static int update_hover(App *a)
         return changed;
     }
 
+    if (a->ui.pair_open) {
+        SET_HOVER(hover_nav, -1);
+        SET_HOVER(hover_toggle, 0);
+        SET_HOVER(hover_scan, 0);
+        SET_HOVER(hover_pair, 0);
+        SET_HOVER(hover_enable, 0);
+        SET_HOVER(hover_row, -1);
+        SET_HOVER(hover_row_action, WIFI_ACTION_NONE);
+        SET_HOVER(hover_row_action_idx, -1);
+        SET_HOVER(hover_pair_field, hit_pair_field(a, x, y));
+        SET_HOVER(hover_pair_cancel, hit_pair_cancel(a, x, y));
+        SET_HOVER(hover_pair_confirm, hit_pair_confirm(a, x, y));
+        return changed;
+    }
+
     SET_HOVER(hover_nav, hit_nav(x, y));
     SET_HOVER(hover_toggle, hit_toggle(x, y));
     SET_HOVER(hover_scan, hit_scan(a, x, y));
@@ -4350,6 +5317,9 @@ static int update_hover(App *a)
     SET_HOVER(hover_connect_field, hit_connect_field(a, x, y));
     SET_HOVER(hover_connect_cancel, hit_connect_cancel(a, x, y));
     SET_HOVER(hover_connect_submit, hit_connect_submit(a, x, y));
+    SET_HOVER(hover_pair_field, 0);
+    SET_HOVER(hover_pair_cancel, 0);
+    SET_HOVER(hover_pair_confirm, 0);
 
 #undef SET_HOVER
     return changed;
@@ -4366,7 +5336,12 @@ static void update_cursor(App *a)
     }
 
     uint32_t shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
-    if (a->ui.connect_open) {
+    if (a->ui.pair_open) {
+        if (a->ui.hover_pair_field)
+            shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT;
+        else if (a->ui.hover_pair_cancel || a->ui.hover_pair_confirm)
+            shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
+    } else if (a->ui.connect_open) {
         if (a->ui.hover_connect_field)
             shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT;
         else if (a->ui.hover_connect_cancel || a->ui.hover_connect_submit)
@@ -4409,7 +5384,7 @@ static void connect_modal_open(App *a, int idx)
     Ui *u = &a->ui;
     if (u->connect_open || u->connect_busy ||
         u->wifi_action_kind != WIFI_ACTION_NONE ||
-        a->action_fd >= 0 || a->action_pid > 0 ||
+        a->bt_op != NULL ||
         idx < 0 || idx >= u->net_count)
         return;
 
@@ -4449,7 +5424,7 @@ static void toggle_active(App *a)
     if (a->ui.tab == TAB_WIFI) {
         set_wifi_radio(a, !a->ui.wifi_on);
     } else {
-        set_bt_radio(&a->ui, !a->ui.bt_on);
+        set_bt_radio(a, !a->ui.bt_on);
     }
     a->resync_at = mono_sec() + 1.2;
     update_hover(a);
@@ -4488,6 +5463,9 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
     a->ui.hover_connect_field = 0;
     a->ui.hover_connect_cancel = 0;
     a->ui.hover_connect_submit = 0;
+    a->ui.hover_pair_field = 0;
+    a->ui.hover_pair_cancel = 0;
+    a->ui.hover_pair_confirm = 0;
     a->ui.press_toggle = 0;
     update_cursor(a);
     mark_dirty(a);
@@ -4518,6 +5496,24 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
     mark_dirty(a);
     double x = a->pointer_x;
     double y = a->pointer_y;
+
+    if (a->ui.pair_open) {
+        if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+            update_hover(a);
+            update_cursor(a);
+            if (hit_pair_field(a, x, y)) {
+                a->ui.pair_caret_t = a->ui.t;
+                mark_dirty(a);
+            } else if (hit_pair_cancel(a, x, y)) {
+                bt_agent_cancel(a);
+            } else if (hit_pair_confirm(a, x, y)) {
+                bt_agent_submit(a);
+            } else if (!hit_pair_card(x, y)) {
+                bt_agent_cancel(a);
+            }
+        }
+        return;
+    }
 
     if (a->ui.connect_open) {
         if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
@@ -4556,20 +5552,25 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
                 request_wifi_scan(a);
             }
         } else if (hit_pair(a, x, y)) {
-            a->ui.pair_t = mono_sec() - a->t0;
+            toggle_bt_discovery(a);
         } else if (hit_enable(a, x, y)) {
             if (a->ui.tab == TAB_WIFI)
                 set_wifi_radio(a, 1);
             else
-                set_bt_radio(&a->ui, 1);
+                set_bt_radio(a, 1);
             a->resync_at = mono_sec() + 1.2;
         } else if (a->ui.tab == TAB_BLUETOOTH && row >= 0 &&
                    row_action != WIFI_ACTION_NONE) {
             start_bt_action(a, row_action, row);
-        } else if (a->ui.tab == TAB_BLUETOOTH && row >= 0) {
+        } else if (a->ui.tab == TAB_BLUETOOTH && row >= 0 &&
+                   row < a->ui.bt_count) {
             BtDev *d = &a->ui.bt[row];
             if (!d->connected)
                 start_bt_action(a, BT_ACTION_CONNECT, row);
+        } else if (a->ui.tab == TAB_BLUETOOTH && row >= a->ui.bt_count &&
+                   row < a->ui.bt_count + a->ui.bt_found_count) {
+            /* Clicking a discovered row starts pairing, like its PAIR button. */
+            start_bt_action(a, BT_ACTION_PAIR, row);
         } else if (a->ui.tab == TAB_WIFI && row >= 0 &&
                    row_action != WIFI_ACTION_NONE) {
             start_wifi_action(a, row_action, row);
@@ -4753,6 +5754,10 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
     if (state != WL_KEYBOARD_KEY_STATE_PRESSED || !a->xkb_state)
         return;
 
+    if (a->ui.pair_open) {
+        pair_modal_key(a, key);
+        return;
+    }
     if (a->ui.connect_open) {
         connect_modal_key(a, key);
         return;
@@ -4779,7 +5784,7 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
                 request_wifi_scan(a);
             }
         } else if (a->ui.bt_on) {
-            a->ui.pair_t = mono_sec() - a->t0;
+            toggle_bt_discovery(a);
         }
     }
 }
@@ -5201,21 +6206,15 @@ static int pump_events(App *a, int timeout_ms)
         timeout_ms = 16;
     if (a->net_pending > 0 && timeout_ms > 16)
         timeout_ms = 16;
+    if (a->bt_pending > 0 && timeout_ms > 16)
+        timeout_ms = 16;
 
-    struct pollfd pfd[4];
+    struct pollfd pfd[3];
     pfd[0].fd = wl_display_get_fd(a->display);
     pfd[0].events = POLLIN | (want_write ? POLLOUT : 0);
     pfd[0].revents = 0;
 
     int nfds = 1;
-    int action_idx = -1;
-    if (a->action_fd >= 0) {
-        action_idx = nfds;
-        pfd[nfds].fd = a->action_fd;
-        pfd[nfds].events = POLLIN;
-        pfd[nfds].revents = 0;
-        nfds++;
-    }
 
     int ctl_idx = -1;
     int ctl_client_idx = -1;
@@ -5251,37 +6250,6 @@ static int pump_events(App *a, int timeout_ms)
             return -1;
     }
 
-    if (action_idx >= 0 && pfd[action_idx].revents) {
-        if (pfd[action_idx].revents & (POLLERR | POLLNVAL)) {
-            finish_action(a);
-        } else {
-            for (;;) {
-                char tmp[2048];
-                ssize_t n = read(a->action_fd, tmp, sizeof tmp);
-                if (n > 0) {
-                    size_t room = sizeof(a->action_buf) - a->action_len - 1;
-                    size_t take = (size_t)n < room ? (size_t)n : room;
-                    if (take > 0) {
-                        memcpy(a->action_buf + a->action_len, tmp, take);
-                        a->action_len += take;
-                    }
-                    continue;
-                }
-                if (n == 0) {
-                    finish_action(a);
-                    break;
-                }
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    break;
-                finish_action(a);
-                break;
-            }
-            if (a->action_fd >= 0 &&
-                (pfd[action_idx].revents & POLLHUP))
-                finish_action(a);
-        }
-    }
-
     if (ctl_idx >= 0 && (pfd[ctl_idx].revents & POLLIN))
         ctl_accept(a);
     if (ctl_client_idx >= 0 && pfd[ctl_client_idx].revents)
@@ -5298,7 +6266,9 @@ static void on_signal(int sig)
 static void app_cleanup(App *a)
 {
     ctl_cleanup(a);
-    cancel_action(a);
+    stop_bt_discovery_sync(a);
+    bt_agent_unregister(a);
+    bt_cancel_op(a);
     if (a->frame_cb) {
         wl_callback_destroy(a->frame_cb);
         a->frame_cb = NULL;
@@ -5310,6 +6280,22 @@ static void app_cleanup(App *a)
     if (a->nm) {
         g_signal_handlers_disconnect_by_data(a->nm, a);
         g_clear_object(&a->nm);
+    }
+    if (a->bt_bus) {
+        if (a->bt_prop_sig)
+            g_dbus_connection_signal_unsubscribe(a->bt_bus, a->bt_prop_sig);
+        if (a->bt_om_sig)
+            g_dbus_connection_signal_unsubscribe(a->bt_bus, a->bt_om_sig);
+        if (a->bt_name_sig)
+            g_dbus_connection_signal_unsubscribe(a->bt_bus, a->bt_name_sig);
+    }
+    /* Dispatch cancellations so orphaned Bluetooth ops free themselves. */
+    for (int i = 0; i < 32 && g_main_context_pending(NULL); i++)
+        g_main_context_iteration(NULL, FALSE);
+    g_clear_object(&a->bt_bus);
+    if (a->bt_cancel) {
+        g_cancellable_cancel(a->bt_cancel);
+        g_clear_object(&a->bt_cancel);
     }
     if (a->base) {
         cairo_surface_destroy(a->base);
@@ -5450,12 +6436,15 @@ static int write_screenshot(const char *path, const char *tab_name, int off)
     u.hover_nav = -1;
     u.hover_row = -1;
     u.scan_t = -10.0;
-    u.pair_t = -10.0;
     u.t = 2.35;
     u.deco_t = 2.35;
 
     NMClient *nm = nm_client_new(NULL, NULL);
-    sys_refresh(&u, nm);
+    GError *bt_err = NULL;
+    GDBusConnection *bt = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &bt_err);
+    g_clear_error(&bt_err);
+    sys_refresh(&u, nm, bt, NULL);
+    g_clear_object(&bt);
     if (nm)
         g_object_unref(nm);
     u.wifi_on = 1;
@@ -5554,12 +6543,11 @@ int main(int argc, char **argv)
     App a;
     memset(&a, 0, sizeof a);
     a.scale = 1;
-    a.action_fd = -1;
-    a.action_pid = -1;
     a.ctl_fd = -1;
     a.ctl_client_fd = -1;
     state_load(&a);
     a.net_cancel = g_cancellable_new();
+    a.bt_cancel = g_cancellable_new();
     a.ui.tab = TAB_WIFI;
     a.ui.wifi_on = 1;
     a.ui.bt_on = 1;
@@ -5575,7 +6563,6 @@ int main(int argc, char **argv)
     a.ui.allow_mutation = 1;
     a.ui.connect_idx = -1;
     a.ui.scan_t = -10.0;
-    a.ui.pair_t = -10.0;
 
     const char *scale_env = getenv("JTNETWORKS_SCALE");
     if (scale_env && *scale_env) {
@@ -5623,7 +6610,29 @@ int main(int argc, char **argv)
                          G_CALLBACK(nm_changed_cb), &a);
     }
 
-    sys_refresh(&a.ui, a.nm);
+    GError *bt_err = NULL;
+    a.bt_bus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &bt_err);
+    if (!a.bt_bus) {
+        fprintf(stderr, "jtnetworks: BlueZ D-Bus unavailable: %s\n",
+                bt_err ? bt_err->message : "unknown error");
+        g_clear_error(&bt_err);
+    } else {
+        a.bt_prop_sig = g_dbus_connection_signal_subscribe(
+            a.bt_bus, BLUEZ_SERVICE, BLUEZ_PROPERTIES_IFACE,
+            "PropertiesChanged", NULL, NULL, G_DBUS_SIGNAL_FLAGS_NONE,
+            bt_signal_cb, &a, NULL);
+        a.bt_om_sig = g_dbus_connection_signal_subscribe(
+            a.bt_bus, BLUEZ_SERVICE, BLUEZ_OBJECT_MANAGER_IFACE,
+            NULL, BLUEZ_ROOT_PATH, NULL, G_DBUS_SIGNAL_FLAGS_NONE,
+            bt_signal_cb, &a, NULL);
+        a.bt_name_sig = g_dbus_connection_signal_subscribe(
+            a.bt_bus, "org.freedesktop.DBus", "org.freedesktop.DBus",
+            "NameOwnerChanged", "/org/freedesktop/DBus", BLUEZ_SERVICE,
+            G_DBUS_SIGNAL_FLAGS_NONE, bt_signal_cb, &a, NULL);
+        bt_agent_register(&a);
+    }
+
+    sys_refresh(&a.ui, a.nm, a.bt_bus, a.bt_cancel);
     a.ui.wifi_k = a.ui.wifi_on ? 1.0 : 0.0;
     a.ui.bt_k = a.ui.bt_on ? 1.0 : 0.0;
     request_wifi_scan(&a);
@@ -5660,8 +6669,17 @@ int main(int argc, char **argv)
             mark_dirty(&a);
         }
 
+        /* A nearby device's friendly Name frequently arrives after the
+         * object first appears.  Poll BlueZ while scanning so rows pick up
+         * late name changes even if a PropertiesChanged signal is missed. */
+        if (a.ui.bt_discovering && a.bt_poll_at > 0.0 && now >= a.bt_poll_at) {
+            read_bt(&a.ui, a.bt_bus, a.bt_cancel);
+            a.bt_poll_at = now + 2.0;
+            mark_dirty(&a);
+        }
+
         if (a.resync_at > 0.0 && now >= a.resync_at) {
-            sys_refresh(&a.ui, a.nm);
+            sys_refresh(&a.ui, a.nm, a.bt_bus, a.bt_cancel);
             update_hover(&a);
             update_cursor(&a);
             if (a.ui.wifi_on)
@@ -5677,12 +6695,13 @@ int main(int argc, char **argv)
             fabs(a.ui.tab_mix -
                  (a.ui.tab == TAB_BLUETOOTH ? 1.0 : 0.0)) > 0.003;
         int spinner_animating =
-            (a.ui.t - a.ui.scan_t >= 0.0 && a.ui.t - a.ui.scan_t < 2.0) ||
-            (a.ui.t - a.ui.pair_t >= 0.0 && a.ui.t - a.ui.pair_t < 2.0);
+            (a.ui.t - a.ui.scan_t >= 0.0 && a.ui.t - a.ui.scan_t < 2.0);
         int caret_animating =
-            a.ui.connect_open && a.ui.connect_focus &&
-            a.ui.connect_secure && !a.ui.connect_busy &&
-            a.keyboard_focused;
+            (a.ui.connect_open && a.ui.connect_focus &&
+             a.ui.connect_secure && !a.ui.connect_busy &&
+             a.keyboard_focused) ||
+            (a.ui.pair_open && pair_wants_entry(a.ui.pair_kind) &&
+             a.keyboard_focused);
         int animating = k_animating || tab_animating || spinner_animating;
         int use_cache = !(k_animating || tab_animating);
 
@@ -5704,7 +6723,7 @@ int main(int argc, char **argv)
         else
             interval = 1.0 / AMBIENT_FPS;
 
-        int ambient = a.configured && !a.ui.connect_open;
+        int ambient = a.configured && !a.ui.connect_open && !a.ui.pair_open;
         int need_draw = a.dirty || animating || ambient || caret_animating;
         int due = a.dirty || a.last_draw == 0.0 ||
                   now - a.last_draw >= interval;
