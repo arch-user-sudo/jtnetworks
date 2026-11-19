@@ -81,6 +81,7 @@
 #define BT_PAIR_TIMEOUT_MS         120000
 #define BT_SET_TIMEOUT_MS          5000
 #define BT_STOP_TIMEOUT_MS         1500
+#define WIFI_SCAN_ANIM_MIN_SECONDS 2.0
 
 /* In-flight Bluetooth operations, tracked like the libnm async ops. */
 enum { BT_OP_POWER = 20, BT_OP_TRUST };
@@ -113,6 +114,17 @@ static double WIN_H = WIN_H_DESIGN;
 #define LIST_Y 306.0
 #define ROW_H 54.0
 #define ROW_GAP 8.0
+#define ROW_STRIDE (ROW_H + ROW_GAP)
+/* Fill the space down to the footer divider, leaving a small gap. */
+#define LIST_VIEW_H (WIN_H - 46.0 - LIST_Y)
+/* One extra row covers fractional offsets while easing. */
+#define LIST_VISIBLE_ROWS ((int)((LIST_VIEW_H + ROW_GAP) / ROW_STRIDE) + 1)
+
+/* Rows and the section action sit slightly inside the content edge; the
+ * scrollbar lives in the gap to their right. */
+#define LIST_RIGHT_PAD 14.0
+#define LIST_RIGHT (CONTENT_X + CONTENT_W - LIST_RIGHT_PAD)
+#define LIST_W (LIST_RIGHT - CONTENT_X)
 
 /* Compact row actions for saved / connected Wi-Fi networks. */
 #define ROW_ACTION_H 20.0
@@ -539,6 +551,11 @@ typedef struct {
     int net_count;
     SavedWifi saved[MAX_SAVED];
     int saved_count;
+    int wifi_scanning;      /* an NM scan request is in flight */
+    double wifi_scan_anim_until;  /* keep the spinner up at least this long */
+
+    double list_scroll;           /* animated list offset, in pixels */
+    double list_scroll_target;    /* where wheel/touch input wants it */
 
     int wifi_action_kind;   /* 0 none, 1 disconnect, 2 forget, 3 activate */
     int wifi_action_row;
@@ -548,6 +565,7 @@ typedef struct {
     int wifi_msg_ok;
 
     char bt_name[96];
+    char bt_adapter_id[32];         /* hciX, from the real BlueZ object path */
     char bt_adapter_path[128];
     int bt_discoverable;
     BtDev bt[MAX_BT];
@@ -603,7 +621,6 @@ typedef struct {
     int hover_pair_cancel;
     int hover_pair_confirm;
 
-    double scan_t;
     double ptr_x;
     double ptr_y;
 } Ui;
@@ -833,8 +850,9 @@ static void plus_icon(cairo_t *cr, double cx, double cy, double s,
     line(cr, cx, cy - s / 2.0, cx, cy + s / 2.0, 1.4, hex, alpha);
 }
 
+/* Static Wi-Fi icon: concentric rings and a center dot, no moving sweep. */
 static void radar_icon(cairo_t *cr, double cx, double cy, double s,
-                       unsigned hex, double alpha, double t)
+                       unsigned hex, double alpha)
 {
     cairo_new_path(cr);
     cairo_set_line_width(cr, 1.3);
@@ -844,6 +862,12 @@ static void radar_icon(cairo_t *cr, double cx, double cy, double s,
     cairo_arc(cr, cx, cy, s * 0.36, 0, 2.0 * PI);
     cairo_stroke(cr);
     dot(cr, cx, cy, 1.4, hex, alpha);
+}
+
+/* The rotating sweep is only shown while a scan is actually running. */
+static void radar_sweep(cairo_t *cr, double cx, double cy, double s,
+                        double alpha, double t)
+{
     double a = t * 2.2;
     line(cr, cx, cy, cx + cos(a) * s * 0.70, cy + sin(a) * s * 0.70,
          1.2, C_ACCENT, alpha * 0.85);
@@ -1425,6 +1449,7 @@ static void paint_hero_wifi(cairo_t *cr, Ui *u)
 static void paint_hero_bt(cairo_t *cr, Ui *u)
 {
     int on = u->bt_on;
+    int has_adapter = u->bt_adapter_id[0] != 0;
     double a = on ? 1.0 : 0.42;
     double tx = CONTENT_X + 142.0;
 
@@ -1433,7 +1458,8 @@ static void paint_hero_bt(cairo_t *cr, Ui *u)
 
     dot(cr, tx + 3.0, HERO_Y + 29.0, 3.0,
         on ? C_GREEN : C_FAINT, on ? 0.9 : 0.55);
-    text_draw(cr, on ? "POWERED ON" : "RADIO OFF", 8.5, 600,
+    text_draw(cr, !has_adapter ? "NO ADAPTER" :
+              (on ? "POWERED ON" : "RADIO OFF"), 8.5, 600,
               on ? C_GREEN : C_FAINT, a * 0.95,
               tx + 14.0, HERO_Y + 22.0, ALIGN_LEFT, 1.45);
 
@@ -1441,19 +1467,23 @@ static void paint_hero_bt(cairo_t *cr, Ui *u)
               tx, HERO_Y + 38.0, ALIGN_LEFT, 0.0);
 
     char sub[192];
-    if (!on)
+    if (!has_adapter)
+        snprintf(sub, sizeof sub, "No Bluetooth adapter detected.");
+    else if (!on)
         snprintf(sub, sizeof sub, "Enable the radio to manage devices.");
     else if (u->bt_name[0])
-        snprintf(sub, sizeof sub, "%s · adapter hci0", u->bt_name);
+        snprintf(sub, sizeof sub, "%s · adapter %s",
+                 u->bt_name, u->bt_adapter_id);
     else
-        snprintf(sub, sizeof sub, "BlueZ · adapter hci0");
+        snprintf(sub, sizeof sub, "BlueZ · adapter %s", u->bt_adapter_id);
     text_draw(cr, sub, 9.2, 400, C_DIM, a * 0.80,
               tx, HERO_Y + 76.0, ALIGN_LEFT, 0.15);
 
     char paired[32];
     snprintf(paired, sizeof paired, "%d %s", u->bt_paired_total,
              u->bt_paired_total == 1 ? "device" : "devices");
-    hero_stat(cr, tx, "ADAPTER", "hci0", a);
+    hero_stat(cr, tx, "ADAPTER",
+              has_adapter ? u->bt_adapter_id : "None", a);
     hero_stat(cr, tx + 148.0, "PAIRED",
               on ? paired : "—", a);
     hero_stat(cr, tx + 294.0, "DISCOVERABLE",
@@ -1471,7 +1501,7 @@ static void paint_hero_bt(cairo_t *cr, Ui *u)
 static void section_action_ambient(cairo_t *cr, Ui *u, int action_kind)
 {
     double bw = action_kind == 0 ? 78.0 : 92.0;
-    double bx = CONTENT_X + CONTENT_W - bw;
+    double bx = LIST_RIGHT - bw;
     double by = SECTION_Y - 6.0;
     int hover = action_kind == 0 ? u->hover_scan : u->hover_pair;
     int enabled = action_kind == 0 ? u->wifi_on : u->bt_on;
@@ -1479,17 +1509,19 @@ static void section_action_ambient(cairo_t *cr, Ui *u, int action_kind)
     double ia = enabled ? (hover ? 1.0 : 0.82) : 0.35;
 
     if (action_kind == 0) {
-        radar_icon(cr, bx + 18.0, by + 14.0, 6.2, ic, ia, u->deco_t);
+        double ix = bx + 18.0;
+        double iy = by + 14.0;
+        radar_icon(cr, ix, iy, 6.2, ic, ia);
 
-        /* Keep the brief completion sweep on Wi-Fi's SCAN only.  The
-         * Bluetooth button conveys its state with the label instead. */
-        double age = u->t - u->scan_t;
-        if (enabled && age >= 0.0 && age < 2.0) {
-            double a = age * 7.0;
+        /* Keep the spinner up for the whole scan, with a minimum visible
+         * window so a fast scan doesn't reduce it to a single flash. */
+        if (enabled && (u->wifi_scanning ||
+                        u->t < u->wifi_scan_anim_until)) {
+            radar_sweep(cr, ix, iy, 6.2, ia, u->t);
+            double a = fmod(u->t * 2.2, 2.0 * PI);
             cairo_set_line_width(cr, 1.4);
             cairo_new_path(cr);
-            cairo_arc(cr, bx + 18.0, by + 14.0, 8.5,
-                      a, a + PI * 1.25);
+            cairo_arc(cr, ix, iy, 8.5, a, a + PI * 1.25);
             rgba(cr, C_ACCENT, 0.9);
             cairo_stroke(cr);
         }
@@ -1503,7 +1535,7 @@ static void section_header(cairo_t *cr, Ui *u, const char *label,
               CONTENT_X, SECTION_Y, ALIGN_LEFT, 1.65);
 
     double bw = action_kind == 0 ? 78.0 : 92.0;
-    double bx = CONTENT_X + CONTENT_W - bw;
+    double bx = LIST_RIGHT - bw;
     double by = SECTION_Y - 6.0;
     int hover = action_kind == 0 ? u->hover_scan : u->hover_pair;
     int enabled = action_kind == 0 ? u->wifi_on : u->bt_on;
@@ -1540,18 +1572,18 @@ static void section_header(cairo_t *cr, Ui *u, const char *label,
 static void row_shell(cairo_t *cr, Ui *u, double y, int connected,
                       int hover)
 {
-    rounded_rect(cr, CONTENT_X, y, CONTENT_W, ROW_H, 10.0);
+    rounded_rect(cr, CONTENT_X, y, LIST_W, ROW_H, 10.0);
     if (connected) {
         rgba(cr, C_ACCENT, 0.045 + (hover ? 0.018 : 0.0));
         cairo_fill_preserve(cr);
-        rounded_rect(cr, CONTENT_X, y, CONTENT_W, ROW_H, 10.0);
+        rounded_rect(cr, CONTENT_X, y, LIST_W, ROW_H, 10.0);
         cairo_set_line_width(cr, 1.0);
         rgba(cr, C_ACCENT, hover ? 0.38 : 0.26);
         cairo_stroke(cr);
     } else {
         rgba(cr, hover ? C_CARD_HI : C_CARD, hover ? 0.96 : 0.72);
         cairo_fill_preserve(cr);
-        rounded_rect(cr, CONTENT_X, y, CONTENT_W, ROW_H, 10.0);
+        rounded_rect(cr, CONTENT_X, y, LIST_W, ROW_H, 10.0);
         cairo_set_line_width(cr, 1.0);
         rgba(cr, C_BORDER, hover ? 0.62 : 0.34);
         cairo_stroke(cr);
@@ -1624,11 +1656,60 @@ static void paint_row_action(cairo_t *cr, Ui *u, int row, int kind,
               x + w / 2.0, y + 5.5, ALIGN_CENTER, 0.8);
 }
 
+static int list_item_count(const Ui *u)
+{
+    if (u->tab == TAB_WIFI)
+        return u->net_count;
+    return u->bt_count + u->bt_found_count;
+}
+
+static double list_max_scroll(const Ui *u)
+{
+    double content = list_item_count(u) * ROW_STRIDE - ROW_GAP;
+    double max = content - LIST_VIEW_H;
+    return max > 0.0 ? max : 0.0;
+}
+
+static void list_scroll_by(Ui *u, double rows)
+{
+    u->list_scroll_target = clampd(u->list_scroll_target + rows * ROW_STRIDE,
+                                   0.0, list_max_scroll(u));
+}
+
+/* Thin scrollbar on the right edge of the list viewport. */
+static void paint_list_scrollbar(cairo_t *cr, Ui *u)
+{
+    double content = list_item_count(u) * ROW_STRIDE - ROW_GAP;
+    if (content <= LIST_VIEW_H)
+        return;
+
+    double x = LIST_RIGHT + 6.0;
+    rounded_rect(cr, x, LIST_Y, 3.0, LIST_VIEW_H, 1.5);
+    rgba(cr, C_TRACK, 0.30);
+    cairo_fill(cr);
+
+    double thumb_h = LIST_VIEW_H * (LIST_VIEW_H / content);
+    if (thumb_h < 20.0)
+        thumb_h = 20.0;
+    double max = content - LIST_VIEW_H;
+    double frac = max > 0.0 ? clampd(u->list_scroll / max, 0.0, 1.0) : 0.0;
+    double y = LIST_Y + frac * (LIST_VIEW_H - thumb_h);
+    rounded_rect(cr, x, y, 3.0, thumb_h, 1.5);
+    rgba(cr, C_ACCENT, 0.48);
+    cairo_fill(cr);
+}
+
 static void paint_wifi_list(cairo_t *cr, Ui *u)
 {
-    for (int i = 0; i < u->net_count && i < 4; i++) {
+    int count = u->net_count;
+    int first = (int)(u->list_scroll / ROW_STRIDE);
+    if (first < 0)
+        first = 0;
+    double shift = u->list_scroll - first * ROW_STRIDE;
+    for (int i = first; i < count && i < first + LIST_VISIBLE_ROWS;
+         i++) {
         WifiNet *n = &u->nets[i];
-        double y = LIST_Y + i * (ROW_H + ROW_GAP);
+        double y = LIST_Y - shift + (i - first) * ROW_STRIDE;
         int hover = (u->hover_row == i);
         row_shell(cr, u, y, n->connected, hover);
 
@@ -1663,7 +1744,7 @@ static void paint_wifi_list(cairo_t *cr, Ui *u)
         if (!locked && n->security[0] && strstr(n->security, "WEP"))
             locked = 1;
         if (locked && !n->connected && !n->saved)
-            lock_glyph(cr, CONTENT_X + CONTENT_W - 80.0, y + 27.0,
+            lock_glyph(cr, LIST_RIGHT - 80.0, y + 27.0,
                        12.0, C_FAINT, 0.62);
 
         char pct[16];
@@ -1672,11 +1753,11 @@ static void paint_wifi_list(cairo_t *cr, Ui *u)
             text_draw(cr, pct, 10.0, 600,
                       n->connected ? C_ACCENT : C_DIM,
                       n->connected ? 0.9 : 0.62,
-                      CONTENT_X + CONTENT_W - 20.0, y + 10.0,
+                      LIST_RIGHT - 20.0, y + 10.0,
                       ALIGN_RIGHT, 0.0);
         } else {
             text_draw(cr, "SAVED", 7.4, 600, C_FAINT, 0.62,
-                      CONTENT_X + CONTENT_W - 20.0, y + 10.0,
+                      LIST_RIGHT - 20.0, y + 10.0,
                       ALIGN_RIGHT, 0.9);
         }
 
@@ -1688,10 +1769,10 @@ static void paint_wifi_list(cairo_t *cr, Ui *u)
                                 (u->wifi_action_kind == WIFI_ACTION_FORGET ?
                                  "FORGETTING…" : "CONNECTING…");
             text_draw(cr, label, 7.4, 600, C_ACCENT, 0.86,
-                      CONTENT_X + CONTENT_W - 20.0, y + 29.0,
+                      LIST_RIGHT - 20.0, y + 29.0,
                       ALIGN_RIGHT, 0.8);
         } else if (n->connected || n->saved) {
-            double right = CONTENT_X + CONTENT_W - ROW_ACTION_RIGHT_PAD;
+            double right = LIST_RIGHT - ROW_ACTION_RIGHT_PAD;
             double ay = y + ROW_ACTION_Y_OFF;
             if (n->connected) {
                 double ax, aw;
@@ -1710,7 +1791,7 @@ static void paint_wifi_list(cairo_t *cr, Ui *u)
                       8.2, 500,
                       hover ? C_ACCENT : C_FAINT,
                       hover ? 0.90 : 0.62,
-                      CONTENT_X + CONTENT_W - 20.0, y + 29.0,
+                      LIST_RIGHT - 20.0, y + 29.0,
                       ALIGN_RIGHT, 0.1);
         }
     }
@@ -1731,10 +1812,15 @@ static const char *dev_kind_name(DevKind k)
 static void paint_bt_list(cairo_t *cr, Ui *u)
 {
     int total = u->bt_count + u->bt_found_count;
-    for (int i = 0; i < total && i < 4; i++) {
+    int first = (int)(u->list_scroll / ROW_STRIDE);
+    if (first < 0)
+        first = 0;
+    double shift = u->list_scroll - first * ROW_STRIDE;
+    for (int i = first;
+         i < total && i < first + LIST_VISIBLE_ROWS; i++) {
         int found = i >= u->bt_count;
         BtDev *d = found ? &u->bt_found[i - u->bt_count] : &u->bt[i];
-        double y = LIST_Y + i * (ROW_H + ROW_GAP);
+        double y = LIST_Y - shift + (i - first) * ROW_STRIDE;
         int hover = (u->hover_row == i);
         row_shell(cr, u, y, d->connected, hover);
 
@@ -1761,7 +1847,7 @@ static void paint_bt_list(cairo_t *cr, Ui *u)
         unsigned sc = found ? C_ACCENT : (d->connected ? C_GREEN : C_FAINT);
         double sa = found ? 0.80 : (d->connected ? 0.88 : 0.62);
         text_draw(cr, status, 8.8, 500, sc, sa,
-                  CONTENT_X + CONTENT_W - 20.0, y + 10.0,
+                  LIST_RIGHT - 20.0, y + 10.0,
                   ALIGN_RIGHT, 0.1);
 
         int busy = (u->bt_action_kind != BT_ACTION_NONE &&
@@ -1775,10 +1861,10 @@ static void paint_bt_list(cairo_t *cr, Ui *u)
             else if (u->bt_action_kind == BT_ACTION_FORGET)
                 label = "FORGETTING…";
             text_draw(cr, label, 7.4, 600, C_ACCENT, 0.86,
-                      CONTENT_X + CONTENT_W - 20.0, y + 29.0,
+                      LIST_RIGHT - 20.0, y + 29.0,
                       ALIGN_RIGHT, 0.8);
         } else {
-            double right = CONTENT_X + CONTENT_W - ROW_ACTION_RIGHT_PAD;
+            double right = LIST_RIGHT - ROW_ACTION_RIGHT_PAD;
             double ay = y + ROW_ACTION_Y_OFF;
             double ax, aw;
             if (found) {
@@ -1807,10 +1893,10 @@ static void paint_bt_adapter_card(cairo_t *cr, Ui *u)
     if (LIST_Y + u->bt_count * (ROW_H + ROW_GAP) > y - 8.0)
         return;
 
-    rounded_rect(cr, CONTENT_X, y, CONTENT_W, 46.0, 10.0);
+    rounded_rect(cr, CONTENT_X, y, LIST_W, 46.0, 10.0);
     rgba(cr, C_CARD, 0.48);
     cairo_fill_preserve(cr);
-    rounded_rect(cr, CONTENT_X, y, CONTENT_W, 46.0, 10.0);
+    rounded_rect(cr, CONTENT_X, y, LIST_W, 46.0, 10.0);
     cairo_set_line_width(cr, 1.0);
     rgba(cr, C_BORDER, 0.30);
     cairo_stroke(cr);
@@ -1818,8 +1904,8 @@ static void paint_bt_adapter_card(cairo_t *cr, Ui *u)
     double tx = CONTENT_X + 18.0;
     text_draw(cr, "ADAPTER", 7.0, 600, C_FAINT, 0.8,
               tx, y + 10.0, ALIGN_LEFT, 1.2);
-    text_draw(cr, "hci0", 9.5, 600, C_DIM, 0.85,
-              tx, y + 24.0, ALIGN_LEFT, 0.1);
+    text_draw(cr, u->bt_adapter_id[0] ? u->bt_adapter_id : "None",
+              9.5, 600, C_DIM, 0.85, tx, y + 24.0, ALIGN_LEFT, 0.1);
 
     tx = CONTENT_X + 170.0;
     text_draw(cr, "CONTROLLER", 7.0, 600, C_FAINT, 0.8,
@@ -1827,7 +1913,7 @@ static void paint_bt_adapter_card(cairo_t *cr, Ui *u)
     text_draw(cr, u->bt_name[0] ? u->bt_name : "BlueZ",
               9.5, 500, C_DIM, 0.85, tx, y + 24.0, ALIGN_LEFT, 0.1);
 
-    tx = CONTENT_X + CONTENT_W - 18.0;
+    tx = LIST_RIGHT - 18.0;
     text_draw(cr, "DISCOVERABLE", 7.0, 600, C_FAINT, 0.8,
               tx, y + 10.0, ALIGN_RIGHT, 1.2);
     text_draw(cr, u->bt_discoverable ? "Yes" : "No", 9.5, 600,
@@ -2152,8 +2238,14 @@ static void paint_wifi_tab(cairo_t *cr, Ui *u)
         paint_empty_state(cr, u, 1, 1, 0);
     else if (u->net_count == 0)
         paint_empty_state(cr, u, 1, 0, 0);
-    else
+    else {
+        cairo_save(cr);
+        cairo_rectangle(cr, CONTENT_X, LIST_Y, LIST_W, LIST_VIEW_H);
+        cairo_clip(cr);
         paint_wifi_list(cr, u);
+        cairo_restore(cr);
+        paint_list_scrollbar(cr, u);
+    }
 }
 
 static void paint_bt_tab(cairo_t *cr, Ui *u)
@@ -2169,7 +2261,12 @@ static void paint_bt_tab(cairo_t *cr, Ui *u)
     else if (total == 0)
         paint_empty_state(cr, u, 0, 0, u->bt_discovering);
     else {
+        cairo_save(cr);
+        cairo_rectangle(cr, CONTENT_X, LIST_Y, LIST_W, LIST_VIEW_H);
+        cairo_clip(cr);
         paint_bt_list(cr, u);
+        cairo_restore(cr);
+        paint_list_scrollbar(cr, u);
         if (!u->bt_discovering)
             paint_bt_adapter_card(cr, u);
     }
@@ -3001,6 +3098,7 @@ static void read_bt(Ui *u, GDBusConnection *bus, GCancellable *cancel)
         return;
 
     char adapter_path[128] = { 0 };
+    char adapter_id[32] = { 0 };
     char alias[96] = { 0 };
     gboolean powered = FALSE, discoverable = FALSE;
 
@@ -3024,9 +3122,17 @@ static void read_bt(Ui *u, GDBusConnection *bus, GCancellable *cancel)
                 const char *name = NULL;
                 g_variant_lookup(props, "Powered", "b", &powered);
                 g_variant_lookup(props, "Discoverable", "b", &discoverable);
-                if (g_variant_lookup(props, "Alias", "&s", &name) && name)
+                /* Prefer the user-set Alias, then BlueZ's Name. */
+                if (g_variant_lookup(props, "Name", "&s", &name) && name)
+                    snprintf(alias, sizeof alias, "%s", name);
+                name = NULL;
+                if (g_variant_lookup(props, "Alias", "&s", &name) &&
+                    name && name[0])
                     snprintf(alias, sizeof alias, "%s", name);
                 snprintf(adapter_path, sizeof adapter_path, "%s", path);
+                const char *slash = strrchr(path, '/');
+                if (slash && slash[1])
+                    snprintf(adapter_id, sizeof adapter_id, "%s", slash + 1);
             } else if (!g_strcmp0(iface, BLUEZ_DEVICE_IFACE)) {
                 gboolean paired = FALSE, connected = FALSE, trusted = FALSE;
                 const char *addr = NULL, *name = NULL, *alias = NULL;
@@ -3074,9 +3180,14 @@ static void read_bt(Ui *u, GDBusConnection *bus, GCancellable *cancel)
     g_variant_iter_free(objects);
     g_variant_unref(result);
 
-    u->bt_on = powered ? 1 : 0;
+    u->bt_on = adapter_path[0] && powered ? 1 : 0;
     u->bt_discoverable = discoverable ? 1 : 0;
-    snprintf(u->bt_name, sizeof u->bt_name, "%s", alias[0] ? alias : "BlueZ");
+    snprintf(u->bt_adapter_id, sizeof u->bt_adapter_id, "%s", adapter_id);
+    if (adapter_path[0])
+        snprintf(u->bt_name, sizeof u->bt_name, "%s",
+                 alias[0] ? alias : "BlueZ");
+    else
+        u->bt_name[0] = 0;
     snprintf(u->bt_adapter_path, sizeof u->bt_adapter_path, "%s",
              adapter_path);
 
@@ -3135,6 +3246,7 @@ static void bt_signal_cb(GDBusConnection *bus, const char *sender,
             a->ui.bt_discovering = 0;
             a->bt_poll_at = 0.0;
             a->ui.bt_adapter_path[0] = 0;
+            a->ui.bt_adapter_id[0] = 0;
             a->ui.bt_name[0] = 0;
             bt_agent_cancel(a);
             update_hover(a);
@@ -4363,6 +4475,7 @@ static void wifi_scan_cb(GObject *source, GAsyncResult *result,
         g_error_free(err);
 
     a->scan_pending = 0;
+    a->ui.wifi_scanning = 0;
     if (a->net_pending > 0)
         a->net_pending--;
     read_wifi(&a->ui, a->nm);
@@ -4372,15 +4485,31 @@ static void wifi_scan_cb(GObject *source, GAsyncResult *result,
     mark_dirty(a);
 }
 
-static void request_wifi_scan(App *a)
+/* Only user-initiated scans drive the spinner; startup and refresh scans
+ * stay silent so the button is quiet until SCAN is actually pressed. */
+static void request_wifi_scan(App *a, int animate)
 {
-    if (!a->nm || !a->ui.wifi_on || a->scan_pending)
+    if (!a->nm || !a->ui.wifi_on)
         return;
+    if (a->scan_pending) {
+        /* A scan is already running; still give an explicit SCAN press its
+         * visual feedback. */
+        if (animate) {
+            a->ui.wifi_scanning = 1;
+            a->ui.wifi_scan_anim_until =
+                a->ui.t + WIFI_SCAN_ANIM_MIN_SECONDS;
+        }
+        return;
+    }
     NMDevice *dev = wifi_device(a->nm);
     if (!dev)
         return;
 
     a->scan_pending = 1;
+    a->ui.wifi_scanning = animate ? 1 : 0;
+    if (animate)
+        a->ui.wifi_scan_anim_until =
+            a->ui.t + WIFI_SCAN_ANIM_MIN_SECONDS;
     a->net_pending++;
     nm_device_wifi_request_scan_async(
         NM_DEVICE_WIFI(dev), a->net_cancel, wifi_scan_cb, a);
@@ -4406,7 +4535,7 @@ static void wifi_radio_cb(GObject *source, GAsyncResult *result,
     if (a->net_pending > 0)
         a->net_pending--;
     if (a->ui.wifi_on)
-        request_wifi_scan(a);
+        request_wifi_scan(a, 0);
     a->resync_at = mono_sec() + 0.5;
     mark_dirty(a);
 }
@@ -5125,16 +5254,14 @@ static int hit_nav(double x, double y)
 static int hit_scan(App *a, double x, double y)
 {
     return a->ui.tab == TAB_WIFI && a->ui.wifi_on &&
-           x >= CONTENT_X + CONTENT_W - 78.0 &&
-           x <= CONTENT_X + CONTENT_W &&
+           x >= LIST_RIGHT - 78.0 && x <= LIST_RIGHT &&
            y >= SECTION_Y - 6.0 && y <= SECTION_Y + 22.0;
 }
 
 static int hit_pair(App *a, double x, double y)
 {
     return a->ui.tab == TAB_BLUETOOTH && a->ui.bt_on &&
-           x >= CONTENT_X + CONTENT_W - 92.0 &&
-           x <= CONTENT_X + CONTENT_W &&
+           x >= LIST_RIGHT - 92.0 && x <= LIST_RIGHT &&
            y >= SECTION_Y - 6.0 && y <= SECTION_Y + 22.0;
 }
 
@@ -5156,27 +5283,29 @@ static int hit_row(App *a, double x, double y)
                 (a->ui.bt_count + a->ui.bt_found_count);
     if (!on || count <= 0)
         return -1;
-    if (x < CONTENT_X || x > CONTENT_X + CONTENT_W)
+    if (x < CONTENT_X || x > LIST_RIGHT)
         return -1;
-    if (y < LIST_Y || y >= LIST_Y + 4.0 * (ROW_H + ROW_GAP))
+    if (y < LIST_Y || y >= LIST_Y + LIST_VIEW_H)
         return -1;
-    int idx = (int)((y - LIST_Y) / (ROW_H + ROW_GAP));
-    double local = y - (LIST_Y + idx * (ROW_H + ROW_GAP));
-    if (local > ROW_H || idx >= count)
+    double vy = y - LIST_Y + a->ui.list_scroll;
+    int idx = (int)(vy / ROW_STRIDE);
+    double local = vy - idx * ROW_STRIDE;
+    if (local > ROW_H || idx < 0 || idx >= count)
         return -1;
     return idx;
 }
 
 static int hit_row_action(const Ui *u, int row, double x, double y)
 {
-    if (row < 0 || row >= 4)
+    if (row < 0)
         return WIFI_ACTION_NONE;
 
-    double ay = LIST_Y + row * (ROW_H + ROW_GAP) + ROW_ACTION_Y_OFF;
+    double ay = LIST_Y - u->list_scroll + row * ROW_STRIDE +
+                ROW_ACTION_Y_OFF;
     if (y < ay || y > ay + ROW_ACTION_H)
         return WIFI_ACTION_NONE;
 
-    double right = CONTENT_X + CONTENT_W - ROW_ACTION_RIGHT_PAD;
+    double right = LIST_RIGHT - ROW_ACTION_RIGHT_PAD;
     double ax, aw;
 
     if (u->tab == TAB_WIFI) {
@@ -5414,6 +5543,8 @@ static void switch_tab(App *a, int tab)
         return;
     a->ui.tab = tab;
     a->ui.hover_row = -1;
+    a->ui.list_scroll = 0.0;
+    a->ui.list_scroll_target = 0.0;
     update_hover(a);
     update_cursor(a);
     mark_dirty(a);
@@ -5547,10 +5678,8 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
         } else if (nav >= 0) {
             switch_tab(a, nav);
         } else if (hit_scan(a, x, y)) {
-            if (a->ui.wifi_on) {
-                a->ui.scan_t = mono_sec() - a->t0;
-                request_wifi_scan(a);
-            }
+            if (a->ui.wifi_on)
+                request_wifi_scan(a, 1);
         } else if (hit_pair(a, x, y)) {
             toggle_bt_discovery(a);
         } else if (hit_enable(a, x, y)) {
@@ -5594,7 +5723,24 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
 static void pointer_axis(void *data, struct wl_pointer *pointer,
                          uint32_t time, uint32_t axis, wl_fixed_t value)
 {
-    (void)data; (void)pointer; (void)time; (void)axis; (void)value;
+    (void)pointer; (void)time;
+    App *a = data;
+    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+        return;
+
+    double v = wl_fixed_to_double(value);
+    /* Wheel notches arrive as ~10-15 or ~120; touchpads send small
+     * fractional deltas.  Normalize both to rows before easing. */
+    if (fabs(v) >= 100.0)
+        v /= 120.0;
+    else
+        v /= 12.0;
+    if (v == 0.0)
+        return;
+    list_scroll_by(&a->ui, v);
+    update_hover(a);
+    update_cursor(a);
+    mark_dirty(a);
 }
 
 static void pointer_frame(void *data, struct wl_pointer *pointer)
@@ -5779,10 +5925,8 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
         toggle_active(a);
     } else if (sym == XKB_KEY_s || sym == XKB_KEY_S) {
         if (a->ui.tab == TAB_WIFI) {
-            if (a->ui.wifi_on) {
-                a->ui.scan_t = mono_sec() - a->t0;
-                request_wifi_scan(a);
-            }
+            if (a->ui.wifi_on)
+                request_wifi_scan(a, 1);
         } else if (a->ui.bt_on) {
             toggle_bt_discovery(a);
         }
@@ -6418,8 +6562,11 @@ static void seed_demo(Ui *u)
     }
     if (u->bt_on && u->bt_count > 0 && u->bt_paired_total < u->bt_count)
         u->bt_paired_total = u->bt_count;
-    if (u->bt_on && !u->bt_name[0])
+    if (u->bt_on && !u->bt_name[0]) {
         snprintf(u->bt_name, sizeof u->bt_name, "BlueZ 5.87");
+        if (!u->bt_adapter_id[0])
+            snprintf(u->bt_adapter_id, sizeof u->bt_adapter_id, "hci0");
+    }
 }
 
 static int write_screenshot(const char *path, const char *tab_name, int off)
@@ -6435,7 +6582,7 @@ static int write_screenshot(const char *path, const char *tab_name, int off)
     u.bt_k = 1.0;
     u.hover_nav = -1;
     u.hover_row = -1;
-    u.scan_t = -10.0;
+    u.wifi_scan_anim_until = -10.0;
     u.t = 2.35;
     u.deco_t = 2.35;
 
@@ -6504,6 +6651,14 @@ static void ui_step(Ui *u, double dt)
         u->bt_k = u->bt_on ? 1.0 : 0.0;
     if (fabs(u->tab_mix - (u->tab == TAB_BLUETOOTH ? 1.0 : 0.0)) < 0.001)
         u->tab_mix = u->tab == TAB_BLUETOOTH ? 1.0 : 0.0;
+
+    double maxs = list_max_scroll(u);
+    u->list_scroll_target = clampd(u->list_scroll_target, 0.0, maxs);
+    u->list_scroll = clampd(
+        approach(u->list_scroll, u->list_scroll_target, dt, 16.0),
+        0.0, maxs);
+    if (fabs(u->list_scroll_target - u->list_scroll) < 0.1)
+        u->list_scroll = u->list_scroll_target;
 }
 
 int main(int argc, char **argv)
@@ -6562,7 +6717,7 @@ int main(int argc, char **argv)
     a.ui.bt_action_row = -1;
     a.ui.allow_mutation = 1;
     a.ui.connect_idx = -1;
-    a.ui.scan_t = -10.0;
+    a.ui.wifi_scan_anim_until = -10.0;
 
     const char *scale_env = getenv("JTNETWORKS_SCALE");
     if (scale_env && *scale_env) {
@@ -6635,7 +6790,7 @@ int main(int argc, char **argv)
     sys_refresh(&a.ui, a.nm, a.bt_bus, a.bt_cancel);
     a.ui.wifi_k = a.ui.wifi_on ? 1.0 : 0.0;
     a.ui.bt_k = a.ui.bt_on ? 1.0 : 0.0;
-    request_wifi_scan(&a);
+    request_wifi_scan(&a, 0);
 
     if (!wayland_start(&a)) {
         app_cleanup(&a);
@@ -6683,7 +6838,7 @@ int main(int argc, char **argv)
             update_hover(&a);
             update_cursor(&a);
             if (a.ui.wifi_on)
-                request_wifi_scan(&a);
+                request_wifi_scan(&a, 0);
             a.resync_at = 0.0;
             mark_dirty(&a);
         }
@@ -6694,16 +6849,25 @@ int main(int argc, char **argv)
         int tab_animating =
             fabs(a.ui.tab_mix -
                  (a.ui.tab == TAB_BLUETOOTH ? 1.0 : 0.0)) > 0.003;
-        int spinner_animating =
-            (a.ui.t - a.ui.scan_t >= 0.0 && a.ui.t - a.ui.scan_t < 2.0);
+        int spinner_animating = a.ui.wifi_scanning ||
+            a.ui.t < a.ui.wifi_scan_anim_until;
         int caret_animating =
             (a.ui.connect_open && a.ui.connect_focus &&
              a.ui.connect_secure && !a.ui.connect_busy &&
              a.keyboard_focused) ||
             (a.ui.pair_open && pair_wants_entry(a.ui.pair_kind) &&
              a.keyboard_focused);
-        int animating = k_animating || tab_animating || spinner_animating;
-        int use_cache = !(k_animating || tab_animating);
+        int scroll_animating =
+            fabs(a.ui.list_scroll_target - a.ui.list_scroll) > 0.1;
+        if (scroll_animating) {
+            update_hover(&a);
+            update_cursor(&a);
+        }
+        int animating = k_animating || tab_animating ||
+                        spinner_animating || scroll_animating;
+        /* List rows live in the cached base frame, so scrolling must
+         * repaint the whole content instead of overlaying the cache. */
+        int use_cache = !(k_animating || tab_animating || scroll_animating);
 
         if (prev_animating && !animating)
             mark_dirty(&a);
@@ -6714,7 +6878,7 @@ int main(int argc, char **argv)
         a.ui.deco_t += dt;
 
         double interval;
-        if (tab_animating)
+        if (scroll_animating || tab_animating)
             interval = 1.0 / TAB_FPS;
         else if (k_animating || caret_animating)
             interval = 1.0 / 30.0;
