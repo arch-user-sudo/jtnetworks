@@ -110,6 +110,11 @@ static double WIN_H = WIN_H_DESIGN;
 
 #define HERO_Y 108.0
 #define HERO_H 158.0
+#define HERO_STAT_X (CONTENT_X + 142.0)
+#define HERO_STAT_VALUE_Y (HERO_Y + 118.0)
+#define HERO_DISCOVERABLE_X (HERO_STAT_X + 294.0)
+#define HERO_DISCOVERABLE_HIT_W 44.0
+#define HERO_DISCOVERABLE_HIT_H 20.0
 #define SECTION_Y 278.0
 #define LIST_Y 306.0
 #define ROW_H 54.0
@@ -589,6 +594,7 @@ typedef struct {
     int hover_scan;
     int hover_pair;
     int hover_enable;
+    int hover_bt_discoverable;
     int hover_row;       /* -1 none, otherwise visible row */
     int hover_row_action;     /* 0 none, 1 disconnect, 2 forget */
     int hover_row_action_idx; /* row containing the hovered action */
@@ -1383,12 +1389,17 @@ static void hero_icon_plate(cairo_t *cr, Ui *u, int on, int is_wifi)
 }
 
 static void hero_stat(cairo_t *cr, double x, const char *label,
-                      const char *value, double alpha)
+                      const char *value, double alpha, int underline)
 {
     text_draw(cr, label, 7.2, 600, C_FAINT, alpha * 0.86,
               x, HERO_Y + 106.0, ALIGN_LEFT, 1.2);
     text_draw(cr, value, 10.4, 600, C_FG, alpha * 0.92,
-              x, HERO_Y + 118.0, ALIGN_LEFT, 0.1);
+              x, HERO_STAT_VALUE_Y, ALIGN_LEFT, 0.1);
+    if (underline) {
+        double w = text_width(cr, value, 10.4, 600, 0.1);
+        line(cr, x, HERO_STAT_VALUE_Y + 14.0, x + w,
+             HERO_STAT_VALUE_Y + 14.0, 1.0, C_ACCENT, 0.78);
+    }
 }
 
 static void hero_separator(cairo_t *cr, double x)
@@ -1401,7 +1412,7 @@ static void paint_hero_wifi(cairo_t *cr, Ui *u)
 {
     int on = u->wifi_on;
     double a = on ? 1.0 : 0.42;
-    double tx = CONTENT_X + 142.0;
+    double tx = HERO_STAT_X;
 
     hero_begin(cr, u, on);
     hero_icon_plate(cr, u, on, 1);
@@ -1434,12 +1445,12 @@ static void paint_hero_wifi(cairo_t *cr, Ui *u)
     char sig[32];
     snprintf(sig, sizeof sig, "%d%%", u->signal);
     hero_stat(cr, tx, "IP ADDRESS",
-              (on && u->wifi_connected && u->ip[0]) ? u->ip : "—", a);
+              (on && u->wifi_connected && u->ip[0]) ? u->ip : "—", a, 0);
     hero_stat(cr, tx + 148.0, "SIGNAL",
-              (on && u->wifi_connected) ? sig : "—", a);
+              (on && u->wifi_connected) ? sig : "—", a, 0);
     hero_stat(cr, tx + 294.0, "SECURITY",
               (on && u->wifi_connected && u->security[0]) ?
-              u->security : "—", a);
+              u->security : "—", a, 0);
     hero_separator(cr, tx + 132.0);
     hero_separator(cr, tx + 278.0);
 
@@ -1451,7 +1462,7 @@ static void paint_hero_bt(cairo_t *cr, Ui *u)
     int on = u->bt_on;
     int has_adapter = u->bt_adapter_id[0] != 0;
     double a = on ? 1.0 : 0.42;
-    double tx = CONTENT_X + 142.0;
+    double tx = HERO_STAT_X;
 
     hero_begin(cr, u, on);
     hero_icon_plate(cr, u, on, 0);
@@ -1482,12 +1493,14 @@ static void paint_hero_bt(cairo_t *cr, Ui *u)
     char paired[32];
     snprintf(paired, sizeof paired, "%d %s", u->bt_paired_total,
              u->bt_paired_total == 1 ? "device" : "devices");
+    const char *discoverable = !on ? "—" :
+                               (u->bt_discoverable ? "Yes" : "No");
     hero_stat(cr, tx, "ADAPTER",
-              has_adapter ? u->bt_adapter_id : "None", a);
+              has_adapter ? u->bt_adapter_id : "None", a, 0);
     hero_stat(cr, tx + 148.0, "PAIRED",
-              on ? paired : "—", a);
-    hero_stat(cr, tx + 294.0, "DISCOVERABLE",
-              on ? (u->bt_discoverable ? "Yes" : "No") : "—", a);
+              on ? paired : "—", a, 0);
+    hero_stat(cr, tx + 294.0, "DISCOVERABLE", discoverable, a,
+              u->hover_bt_discoverable);
     hero_separator(cr, tx + 132.0);
     hero_separator(cr, tx + 278.0);
 
@@ -3439,6 +3452,86 @@ static void set_bt_radio(App *a, int on)
     mark_dirty(a);
 }
 
+/* Clicking the DISCOVERABLE value changes the Adapter1 property directly.
+ * This is independent of the powered/device-action op queue. */
+typedef struct {
+    App *a;
+    int on;
+} BtDiscoverableOp;
+
+static void bt_discoverable_cb(GObject *source, GAsyncResult *result,
+                               gpointer data)
+{
+    BtDiscoverableOp *op = data;
+    App *a = op->a;
+    Ui *u = &a->ui;
+    GError *err = NULL;
+    GVariant *reply = source ? g_dbus_connection_call_finish(
+        G_DBUS_CONNECTION(source), result, &err) : NULL;
+    if (reply)
+        g_variant_unref(reply);
+
+    if (err && g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+        g_clear_error(&err);
+        g_free(op);
+        return;
+    }
+
+    char msg[256] = { 0 };
+    if (err) {
+        snprintf(msg, sizeof msg, "%s", err->message);
+        g_clear_error(&err);
+    }
+
+    if (msg[0]) {
+        u->bt_discoverable = !op->on;
+        u->bt_msg_ok = 0;
+        snprintf(u->bt_msg, sizeof u->bt_msg, "Failed: %.145s", msg);
+        u->bt_msg_t = u->t;
+    } else {
+        u->bt_msg_ok = 1;
+        snprintf(u->bt_msg, sizeof u->bt_msg, "%s",
+                 op->on ? "Discoverable on" : "Discoverable off");
+        u->bt_msg_t = u->t;
+    }
+
+    a->resync_at = mono_sec() + (msg[0] ? 1.0 : 0.3);
+    update_hover(a);
+    update_cursor(a);
+    mark_dirty(a);
+    g_free(op);
+}
+
+static void set_bt_discoverable(App *a, int on)
+{
+    Ui *u = &a->ui;
+    if (!a->bt_bus || !u->bt_adapter_path[0] || !u->bt_on ||
+        !u->allow_mutation) {
+        u->bt_msg_ok = 0;
+        snprintf(u->bt_msg, sizeof u->bt_msg,
+                 "Failed: Bluetooth unavailable.");
+        u->bt_msg_t = u->t;
+        mark_dirty(a);
+        return;
+    }
+
+    BtDiscoverableOp *op = g_new0(BtDiscoverableOp, 1);
+    op->a = a;
+    op->on = on;
+    u->bt_discoverable = on;          /* optimistic, like the radio toggle */
+
+    /* Keep it discoverable until clicked again instead of expiring with
+     * BlueZ's default DiscoverableTimeout. */
+    if (on)
+        bt_set_property(a->bt_bus, a->bt_cancel, u->bt_adapter_path,
+                        BLUEZ_ADAPTER_IFACE, "DiscoverableTimeout",
+                        g_variant_new_uint16(0), bt_ignore_cb, NULL);
+    bt_set_property(a->bt_bus, a->bt_cancel, u->bt_adapter_path,
+                    BLUEZ_ADAPTER_IFACE, "Discoverable",
+                    g_variant_new_boolean(on), bt_discoverable_cb, op);
+    mark_dirty(a);
+}
+
 /* ---- device discovery --------------------------------------------- */
 
 typedef struct {
@@ -5265,6 +5358,17 @@ static int hit_pair(App *a, double x, double y)
            y >= SECTION_Y - 6.0 && y <= SECTION_Y + 22.0;
 }
 
+static int hit_bt_discoverable(App *a, double x, double y)
+{
+    Ui *u = &a->ui;
+    if (u->tab != TAB_BLUETOOTH || !u->bt_on || !u->bt_adapter_id[0])
+        return 0;
+    return x >= HERO_DISCOVERABLE_X - 2.0 &&
+           x <= HERO_DISCOVERABLE_X + HERO_DISCOVERABLE_HIT_W &&
+           y >= HERO_STAT_VALUE_Y - 2.0 &&
+           y <= HERO_STAT_VALUE_Y + HERO_DISCOVERABLE_HIT_H;
+}
+
 static int hit_enable(App *a, double x, double y)
 {
     int off = (a->ui.tab == TAB_WIFI) ? !a->ui.wifi_on : !a->ui.bt_on;
@@ -5408,6 +5512,7 @@ static int update_hover(App *a)
         SET_HOVER(hover_scan, 0);
         SET_HOVER(hover_pair, 0);
         SET_HOVER(hover_enable, 0);
+        SET_HOVER(hover_bt_discoverable, 0);
         SET_HOVER(hover_row, -1);
         SET_HOVER(hover_row_action, WIFI_ACTION_NONE);
         SET_HOVER(hover_row_action_idx, -1);
@@ -5423,6 +5528,7 @@ static int update_hover(App *a)
         SET_HOVER(hover_scan, 0);
         SET_HOVER(hover_pair, 0);
         SET_HOVER(hover_enable, 0);
+        SET_HOVER(hover_bt_discoverable, 0);
         SET_HOVER(hover_row, -1);
         SET_HOVER(hover_row_action, WIFI_ACTION_NONE);
         SET_HOVER(hover_row_action_idx, -1);
@@ -5437,6 +5543,7 @@ static int update_hover(App *a)
     SET_HOVER(hover_scan, hit_scan(a, x, y));
     SET_HOVER(hover_pair, hit_pair(a, x, y));
     SET_HOVER(hover_enable, hit_enable(a, x, y));
+    SET_HOVER(hover_bt_discoverable, hit_bt_discoverable(a, x, y));
     int row = hit_row(a, x, y);
     int row_action = hit_row_action(&a->ui, row, x, y);
     SET_HOVER(hover_row, row);
@@ -5477,6 +5584,7 @@ static void update_cursor(App *a)
             shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
     } else if (a->ui.hover_toggle ||
         a->ui.hover_scan || a->ui.hover_pair || a->ui.hover_enable ||
+        a->ui.hover_bt_discoverable ||
         a->ui.hover_row >= 0 || a->ui.hover_nav >= 0) {
         shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER;
     } else if (a->pointer_x >= 0.0 && a->pointer_y >= 0.0 &&
@@ -5590,6 +5698,7 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
     a->ui.hover_scan = 0;
     a->ui.hover_pair = 0;
     a->ui.hover_enable = 0;
+    a->ui.hover_bt_discoverable = 0;
     a->ui.hover_row = -1;
     a->ui.hover_connect_field = 0;
     a->ui.hover_connect_cancel = 0;
@@ -5682,6 +5791,8 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
                 request_wifi_scan(a, 1);
         } else if (hit_pair(a, x, y)) {
             toggle_bt_discovery(a);
+        } else if (hit_bt_discoverable(a, x, y)) {
+            set_bt_discoverable(a, !a->ui.bt_discoverable);
         } else if (hit_enable(a, x, y)) {
             if (a->ui.tab == TAB_WIFI)
                 set_wifi_radio(a, 1);
