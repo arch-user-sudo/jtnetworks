@@ -1382,7 +1382,10 @@ static void hero_end(cairo_t *cr, int on)
 
 static void hero_icon_plate(cairo_t *cr, Ui *u, int on, int is_wifi)
 {
-    if (u->ambient_skip)
+    /* The base cache normally omits the plate because the ambient overlay
+     * repaints it.  With a modal open that overlay is suppressed, so keep
+     * the plate in the base — where the modal is painted over it. */
+    if (u->ambient_skip && !u->connect_open && !u->pair_open)
         return;
 
     double x = CONTENT_X + 28.0;
@@ -2380,24 +2383,6 @@ static void paint_ambient(cairo_t *cr, Ui *u)
     cairo_restore(cr);
 
     section_action_ambient(cr, u, is_wifi ? 0 : 1);
-}
-
-/* The cached base is built with ambient_skip=1, which also omits the hero
- * plate.  Keep that static plate on top when a modal suppresses the animated
- * ambient overlay; otherwise the hero area behind the dialog looks bare. */
-static void paint_hero_plate_overlay(cairo_t *cr, Ui *u)
-{
-    int is_wifi = (u->tab == TAB_WIFI);
-    int on = is_wifi ? u->wifi_on : u->bt_on;
-    int skip = u->ambient_skip;
-
-    cairo_save(cr);
-    rounded_rect(cr, CONTENT_X, HERO_Y, CONTENT_W, HERO_H, 14.0);
-    cairo_clip(cr);
-    u->ambient_skip = 0;
-    hero_icon_plate(cr, u, on, is_wifi);
-    u->ambient_skip = skip;
-    cairo_restore(cr);
 }
 
 /* ------------------------------------------------------------------ */
@@ -4730,8 +4715,6 @@ static int app_draw(App *a, int use_cache)
         cairo_clip(cr);
         if (!a->ui.connect_open && !a->ui.pair_open)
             paint_ambient(cr, &a->ui);
-        else
-            paint_hero_plate_overlay(cr, &a->ui);
         cairo_restore(cr);
     } else {
         a->base_valid = 0;
