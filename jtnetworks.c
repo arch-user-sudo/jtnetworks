@@ -37,6 +37,7 @@
 
 #include <cairo/cairo.h>
 #include <pango/pangocairo.h>
+#include <fontconfig/fontconfig.h>
 #include <NetworkManager.h>
 #include <gio/gio.h>
 
@@ -378,6 +379,34 @@ static double approach(double cur, double target, double dt, double speed)
 /*  Text                                                               */
 /* ------------------------------------------------------------------ */
 
+/* Some fontconfig setups disable antialiasing globally (for example an
+ * /etc/fonts/local.conf that assigns antialias=false).  Cairo's own font
+ * options cannot override an "assign" rule, so Pango ends up drawing
+ * hard-edged, bilevel glyphs even at small UI sizes.  Merge a late rule
+ * into our private fontconfig configuration before the first layout is
+ * created so text is antialiased regardless of the host configuration.
+ * This is process-local and happens before any font lookups. */
+static void ensure_font_antialiasing(void)
+{
+    static const char cfg_xml[] =
+        "<?xml version=\"1.0\"?>"
+        "<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">"
+        "<fontconfig>"
+        "  <match target=\"font\">"
+        "    <edit mode=\"assign\" name=\"antialias\"><bool>true</bool></edit>"
+        "  </match>"
+        "</fontconfig>";
+
+    FcConfig *cfg = FcConfigGetCurrent();
+    if (!cfg)
+        return;
+    if (!FcConfigParseAndLoadFromMemory(cfg,
+                                        (const FcChar8 *)cfg_xml, FcFalse))
+        return;
+    FcConfigSetCurrent(cfg);
+    FcConfigBuildFonts(cfg);
+}
+
 enum { ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT };
 
 typedef struct {
@@ -504,7 +533,9 @@ typedef enum {
 } DevKind;
 
 typedef struct {
-    char ssid[96];
+    char ssid[96];          /* display form (nm_utils_ssid_to_utf8) */
+    guint8 ssid_raw[32];    /* actual SSID bytes, for connecting */
+    gsize ssid_len;
     int signal;
     char security[32];
     int connected;
@@ -579,6 +610,8 @@ typedef struct {
     BtDev bt_found[MAX_BT_FOUND];   /* unpaired devices seen while scanning */
     int bt_found_count;
     int bt_discovering;
+    int bt_discovery_pending; /* our StartDiscovery call is still in flight */
+    int bt_discovery_stopping; /* our StopDiscovery call is still in flight */
     int bt_action_kind;
     int bt_action_row;
     char bt_msg[160];
@@ -607,6 +640,8 @@ typedef struct {
     int connect_busy;
     int connect_focus;
     char connect_ssid[96];
+    guint8 connect_ssid_raw[32];
+    gsize connect_ssid_len;
     char connect_pass[128];
     char connect_security[32];
     char connect_msg[160];
@@ -2347,6 +2382,24 @@ static void paint_ambient(cairo_t *cr, Ui *u)
     section_action_ambient(cr, u, is_wifi ? 0 : 1);
 }
 
+/* The cached base is built with ambient_skip=1, which also omits the hero
+ * plate.  Keep that static plate on top when a modal suppresses the animated
+ * ambient overlay; otherwise the hero area behind the dialog looks bare. */
+static void paint_hero_plate_overlay(cairo_t *cr, Ui *u)
+{
+    int is_wifi = (u->tab == TAB_WIFI);
+    int on = is_wifi ? u->wifi_on : u->bt_on;
+    int skip = u->ambient_skip;
+
+    cairo_save(cr);
+    rounded_rect(cr, CONTENT_X, HERO_Y, CONTENT_W, HERO_H, 14.0);
+    cairo_clip(cr);
+    u->ambient_skip = 0;
+    hero_icon_plate(cr, u, on, is_wifi);
+    u->ambient_skip = skip;
+    cairo_restore(cr);
+}
+
 /* ------------------------------------------------------------------ */
 /*  System state                                                       */
 /* ------------------------------------------------------------------ */
@@ -2409,6 +2462,21 @@ static char *ssid_to_utf8(GBytes *bytes)
         return NULL;
     }
     return ssid;
+}
+
+static gsize ap_ssid_raw(NMAccessPoint *ap, guint8 *out, gsize cap)
+{
+    if (!ap)
+        return 0;
+    GBytes *bytes = nm_access_point_get_ssid(ap);
+    if (!bytes)
+        return 0;
+    gsize len = 0;
+    const guint8 *data = g_bytes_get_data(bytes, &len);
+    if (!data || len == 0 || len > cap)
+        return 0;
+    memcpy(out, data, len);
+    return len;
 }
 
 static void ap_security_string(NMAccessPoint *ap, char *out, size_t cap)
@@ -2483,6 +2551,35 @@ static NMAccessPoint *wifi_ap_by_ssid(NMDevice *dev, const char *ssid)
         int match = cur && !strcmp(cur, ssid);
         g_free(cur);
         if (!match)
+            continue;
+        int strength = nm_access_point_get_strength(ap);
+        if (strength > best_signal) {
+            best = ap;
+            best_signal = strength;
+        }
+    }
+    return best;
+}
+
+static NMAccessPoint *wifi_ap_by_raw_ssid(NMDevice *dev,
+                                          const guint8 *ssid, gsize len)
+{
+    if (!dev || !NM_IS_DEVICE_WIFI(dev) || !ssid || len == 0)
+        return NULL;
+    const GPtrArray *aps = nm_device_wifi_get_access_points(
+        NM_DEVICE_WIFI(dev));
+    if (!aps)
+        return NULL;
+    NMAccessPoint *best = NULL;
+    int best_signal = -1;
+    for (guint i = 0; i < aps->len; i++) {
+        NMAccessPoint *ap = g_ptr_array_index(aps, i);
+        GBytes *bytes = nm_access_point_get_ssid(ap);
+        if (!bytes)
+            continue;
+        gsize cur_len = 0;
+        const guint8 *cur = g_bytes_get_data(bytes, &cur_len);
+        if (!cur || !nm_utils_same_ssid(ssid, len, cur, cur_len, FALSE))
             continue;
         int strength = nm_access_point_get_strength(ap);
         if (strength > best_signal) {
@@ -2593,10 +2690,20 @@ static void apply_wifi_list(Ui *u, NMClient *nm)
         int connected = ap == active;
         int signal = nm_access_point_get_strength(ap);
         const char *path = nm_object_get_path(NM_OBJECT(ap));
+        guint8 raw[32];
+        gsize raw_len = ap_ssid_raw(ap, raw, sizeof raw);
 
         int found = -1;
         for (int j = 0; j < tc; j++) {
-            if (!strcmp(tmp[j].ssid, ssid)) {
+            /* Distinct binary SSIDs can render to the same display string;
+             * deduplicate on the real bytes, not the escaped form. */
+            int same = raw_len > 0 && tmp[j].ssid_len > 0 &&
+                nm_utils_same_ssid(tmp[j].ssid_raw, tmp[j].ssid_len,
+                                   raw, raw_len, FALSE);
+            if ((raw_len == 0 || tmp[j].ssid_len == 0) &&
+                !strcmp(tmp[j].ssid, ssid))
+                same = 1;
+            if (same) {
                 found = j;
                 break;
             }
@@ -2623,6 +2730,12 @@ static void apply_wifi_list(Ui *u, NMClient *nm)
         WifiNet *n = &tmp[tc++];
         memset(n, 0, sizeof *n);
         snprintf(n->ssid, sizeof n->ssid, "%.95s", ssid);
+        /* The display string may be escaped by nm_utils_ssid_to_utf8();
+         * keep the real bytes so connecting uses the actual SSID. */
+        if (raw_len > 0) {
+            memcpy(n->ssid_raw, raw, raw_len);
+            n->ssid_len = raw_len;
+        }
         n->signal = signal;
         n->connected = connected;
         ap_security_string(ap, n->security, sizeof n->security);
@@ -2723,7 +2836,8 @@ typedef struct {
 typedef struct App App;
 
 typedef struct {
-    struct wl_output *output;
+    struct wl_output *output; /* NULL when the slot is free */
+    uint32_t global_name;
     int32_t scale;
     int entered;
     App *app;
@@ -2737,6 +2851,7 @@ struct App {
     struct xdg_wm_base *wm_base;
     struct zxdg_decoration_manager_v1 *deco_manager;
     struct wl_seat *seat;
+    uint32_t seat_global; /* registry name of the seat we bound */
     struct wl_pointer *pointer;
     uint32_t pointer_serial;
     struct wl_keyboard *keyboard;
@@ -2773,7 +2888,6 @@ struct App {
     int keyboard_focused;
 
     Output outputs[MAX_OUTPUTS];
-    int output_count;
 
     Ui ui;
 
@@ -2806,6 +2920,10 @@ struct App {
     gulong bt_name_sig;
     BtOp *bt_op;            /* one in-flight Bluetooth operation */
     int bt_pending;
+    /* Generation counters let late async replies be ignored after the user
+     * has superseded them with a newer request. */
+    uint64_t discoverable_gen;
+    uint64_t discovery_gen;
 
     /* BlueZ pairing agent and discovery scheduling. */
     guint bt_agent_id;
@@ -2870,9 +2988,14 @@ state_load(App *a)
     char path[512];
     state_path(path, sizeof path);
 
-    FILE *f = fopen(path, "r");
-    if (!f)
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
         return;
+    FILE *f = fdopen(fd, "r");
+    if (!f) {
+        close(fd);
+        return;
+    }
 
     char line[256];
     while (fgets(line, sizeof line, f)) {
@@ -2880,9 +3003,9 @@ state_load(App *a)
         int value;
         if (sscanf(line, " %63[^= \t] = %d", key, &value) != 2)
             continue;
-        if (!strcmp(key, "width") && value > 0)
+        if (!strcmp(key, "width") && value > 0 && value <= 16384)
             a->state_w = value;
-        else if (!strcmp(key, "height") && value > 0)
+        else if (!strcmp(key, "height") && value > 0 && value <= 16384)
             a->state_h = value;
         else if (!strcmp(key, "maximized"))
             a->state_maximized = value != 0;
@@ -2907,16 +3030,23 @@ state_save(App *a)
         state_mkdir_p(dir);
     }
 
-    FILE *f = fopen(path, "w");
-    if (!f)
+    /* Never follow a planted symlink into an arbitrary file. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                  0600);
+    if (fd < 0)
         return;
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        return;
+    }
 
     fprintf(f, "width=%d\nheight=%d\nmaximized=%d\n",
             a->state_w, a->state_h, a->state_maximized);
     fclose(f);
 }
 
-static int g_signal_quit;
+static volatile sig_atomic_t g_signal_quit;
 
 static void mark_dirty(App *a)
 {
@@ -3113,7 +3243,7 @@ static void read_bt(Ui *u, GDBusConnection *bus, GCancellable *cancel)
     char adapter_path[128] = { 0 };
     char adapter_id[32] = { 0 };
     char alias[96] = { 0 };
-    gboolean powered = FALSE, discoverable = FALSE;
+    gboolean powered = FALSE, discoverable = FALSE, discovering = FALSE;
 
     BtDev tmp[MAX_BT];
     BtDev found[MAX_BT_FOUND];
@@ -3127,14 +3257,17 @@ static void read_bt(Ui *u, GDBusConnection *bus, GCancellable *cancel)
     g_variant_get(result, BLUEZ_MANAGED_OBJECTS_TYPE, &objects);
     const char *path;
     GVariantIter *ifaces;
-    while (g_variant_iter_next(objects, "{oa{sa{sv}}}", &path, &ifaces)) {
+    /* Borrowed (&o/&s) so the iterator does not allocate strings we would
+     * have to free on every BlueZ signal. */
+    while (g_variant_iter_next(objects, "{&oa{sa{sv}}}", &path, &ifaces)) {
         const char *iface;
         GVariant *props;
-        while (g_variant_iter_next(ifaces, "{s@a{sv}}", &iface, &props)) {
+        while (g_variant_iter_next(ifaces, "{&s@a{sv}}", &iface, &props)) {
             if (!g_strcmp0(iface, BLUEZ_ADAPTER_IFACE)) {
                 const char *name = NULL;
                 g_variant_lookup(props, "Powered", "b", &powered);
                 g_variant_lookup(props, "Discoverable", "b", &discoverable);
+                g_variant_lookup(props, "Discovering", "b", &discovering);
                 /* Prefer the user-set Alias, then BlueZ's Name. */
                 if (g_variant_lookup(props, "Name", "&s", &name) && name)
                     snprintf(alias, sizeof alias, "%s", name);
@@ -3148,17 +3281,18 @@ static void read_bt(Ui *u, GDBusConnection *bus, GCancellable *cancel)
                     snprintf(adapter_id, sizeof adapter_id, "%s", slash + 1);
             } else if (!g_strcmp0(iface, BLUEZ_DEVICE_IFACE)) {
                 gboolean paired = FALSE, connected = FALSE, trusted = FALSE;
-                const char *addr = NULL, *name = NULL, *alias = NULL;
+                const char *addr = NULL, *name = NULL, *dev_alias = NULL;
                 const char *icon = NULL;
                 g_variant_lookup(props, "Paired", "b", &paired);
                 g_variant_lookup(props, "Connected", "b", &connected);
                 g_variant_lookup(props, "Trusted", "b", &trusted);
                 g_variant_lookup(props, "Address", "&s", &addr);
                 g_variant_lookup(props, "Name", "&s", &name);
-                g_variant_lookup(props, "Alias", "&s", &alias);
+                g_variant_lookup(props, "Alias", "&s", &dev_alias);
                 g_variant_lookup(props, "Icon", "&s", &icon);
                 if (addr && addr[0]) {
-                    const char *shown = bt_device_name(name, alias, addr, icon);
+                    const char *shown =
+                        bt_device_name(name, dev_alias, addr, icon);
                     if (paired) {
                         total++;
                         if (tc < MAX_BT) {
@@ -3195,6 +3329,11 @@ static void read_bt(Ui *u, GDBusConnection *bus, GCancellable *cancel)
 
     u->bt_on = adapter_path[0] && powered ? 1 : 0;
     u->bt_discoverable = discoverable ? 1 : 0;
+    /* BlueZ stops discovery on its own timeout (or another client can stop
+     * it).  Trust the adapter property so the header does not say SCANNING
+     * forever; ignore it while our own StartDiscovery is still in flight. */
+    if (!u->bt_discovery_pending && !u->bt_discovery_stopping)
+        u->bt_discovering = discovering ? 1 : 0;
     snprintf(u->bt_adapter_id, sizeof u->bt_adapter_id, "%s", adapter_id);
     if (adapter_path[0])
         snprintf(u->bt_name, sizeof u->bt_name, "%s",
@@ -3257,6 +3396,10 @@ static void bt_signal_cb(GDBusConnection *bus, const char *sender,
             a->ui.bt_paired_total = 0;
             a->ui.bt_found_count = 0;
             a->ui.bt_discovering = 0;
+            a->ui.bt_discovery_pending = 0;
+            a->ui.bt_discovery_stopping = 0;
+            a->discovery_gen++;
+            a->discoverable_gen++;
             a->bt_poll_at = 0.0;
             a->ui.bt_adapter_path[0] = 0;
             a->ui.bt_adapter_id[0] = 0;
@@ -3456,6 +3599,7 @@ static void set_bt_radio(App *a, int on)
  * This is independent of the powered/device-action op queue. */
 typedef struct {
     App *a;
+    uint64_t gen;
     int on;
 } BtDiscoverableOp;
 
@@ -3471,6 +3615,11 @@ static void bt_discoverable_cb(GObject *source, GAsyncResult *result,
     if (reply)
         g_variant_unref(reply);
 
+    if (op->gen != a->discoverable_gen) {
+        g_clear_error(&err);
+        g_free(op);
+        return;
+    }
     if (err && g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
         g_clear_error(&err);
         g_free(op);
@@ -3517,6 +3666,7 @@ static void set_bt_discoverable(App *a, int on)
 
     BtDiscoverableOp *op = g_new0(BtDiscoverableOp, 1);
     op->a = a;
+    op->gen = ++a->discoverable_gen;
     op->on = on;
     u->bt_discoverable = on;          /* optimistic, like the radio toggle */
 
@@ -3536,6 +3686,7 @@ static void set_bt_discoverable(App *a, int on)
 
 typedef struct {
     App *a;
+    uint64_t gen;
     int start;
 } BtDiscoveryOp;
 
@@ -3547,6 +3698,24 @@ static void bt_discovery_cb(GObject *source, GAsyncResult *result, gpointer data
     GError *err = NULL;
     GVariant *reply = source ? g_dbus_connection_call_finish(
         G_DBUS_CONNECTION(source), result, &err) : NULL;
+    /* Ignore replies from a scan the user has already superseded; without a
+     * generation token an old Start/Stop reply can roll back a newer one. */
+    if (op->gen != a->discovery_gen) {
+        g_clear_error(&err);
+        if (reply)
+            g_variant_unref(reply);
+        g_free(op);
+        return;
+    }
+    if (op->start)
+        u->bt_discovery_pending = 0;
+    else
+        u->bt_discovery_stopping = 0;
+    if (err && g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+        g_clear_error(&err);
+        g_free(op);
+        return;
+    }
     char msg[256] = { 0 };
     if (err)
         snprintf(msg, sizeof msg, "%s", err->message);
@@ -3563,6 +3732,10 @@ static void bt_discovery_cb(GObject *source, GAsyncResult *result, gpointer data
             u->bt_discovering = 0;
             u->bt_found_count = 0;
             a->bt_poll_at = 0.0;
+        } else {
+            /* StopDiscovery failed, so BlueZ may still be scanning. */
+            u->bt_discovering = 1;
+            a->bt_poll_at = mono_sec() + 2.0;
         }
         mark_dirty(a);
     } else if (op->start) {
@@ -3583,9 +3756,12 @@ static void start_bt_discovery(App *a)
 
     BtDiscoveryOp *op = g_new0(BtDiscoveryOp, 1);
     op->a = a;
+    op->gen = ++a->discovery_gen;
     op->start = 1;
 
     u->bt_discovering = 1;
+    u->bt_discovery_pending = 1;
+    u->bt_discovery_stopping = 0;
     u->bt_found_count = 0;
     a->bt_poll_at = mono_sec() + 2.0;
 
@@ -3612,17 +3788,23 @@ static void stop_bt_discovery(App *a)
         return;
 
     u->bt_discovering = 0;
+    u->bt_discovery_pending = 0;
+    u->bt_discovery_stopping = 1;
     u->bt_found_count = 0;
     a->bt_poll_at = 0.0;
 
     if (a->bt_bus && u->bt_adapter_path[0] && u->allow_mutation) {
         BtDiscoveryOp *op = g_new0(BtDiscoveryOp, 1);
         op->a = a;
+        op->gen = ++a->discovery_gen;
         op->start = 0;
         g_dbus_connection_call(a->bt_bus, BLUEZ_SERVICE, u->bt_adapter_path,
                                BLUEZ_ADAPTER_IFACE, "StopDiscovery", NULL, NULL,
                                G_DBUS_CALL_FLAGS_NONE, BT_SET_TIMEOUT_MS,
                                a->bt_cancel, bt_discovery_cb, op);
+    } else {
+        a->discovery_gen++;
+        u->bt_discovery_stopping = 0;
     }
     mark_dirty(a);
 }
@@ -3633,8 +3815,18 @@ static void stop_bt_discovery(App *a)
 static void stop_bt_discovery_sync(App *a)
 {
     Ui *u = &a->ui;
-    if (!u->bt_discovering)
+    if (!u->bt_discovering && !u->bt_discovery_stopping)
         return;
+
+    /* Any outstanding async reply is now irrelevant: we are shutting down. */
+    a->discovery_gen++;
+    u->bt_discovery_pending = 0;
+    u->bt_discovery_stopping = 0;
+    if (!u->bt_discovering) {
+        u->bt_found_count = 0;
+        a->bt_poll_at = 0.0;
+        return;
+    }
 
     if (a->bt_bus && u->bt_adapter_path[0] && u->allow_mutation) {
         GError *err = NULL;
@@ -3647,6 +3839,7 @@ static void stop_bt_discovery_sync(App *a)
         g_clear_error(&err);
     }
     u->bt_discovering = 0;
+    u->bt_discovery_pending = 0;
     u->bt_found_count = 0;
     a->bt_poll_at = 0.0;
 }
@@ -3780,7 +3973,7 @@ static void pair_modal_open(App *a, PairModalKind kind,
                             const char *path, const char *code)
 {
     Ui *u = &a->ui;
-    if (u->pair_open)
+    if (u->pair_open || u->connect_open)
         return;
     const char *name = find_bt_name(u, path);
     u->pair_open = 1;
@@ -4027,6 +4220,19 @@ static int hit_pair_confirm(App *a, double x, double y)
            y >= MODAL_BTN_Y && y <= MODAL_BTN_Y + MODAL_BTN_H;
 }
 
+static size_t utf8_seq_len(unsigned char c)
+{
+    if (c < 0x80)
+        return 1;
+    if ((c & 0xE0) == 0xC0)
+        return 2;
+    if ((c & 0xF0) == 0xE0)
+        return 3;
+    if ((c & 0xF8) == 0xF0)
+        return 4;
+    return 0;
+}
+
 static void pair_modal_key(App *a, uint32_t key)
 {
     Ui *u = &a->ui;
@@ -4068,13 +4274,28 @@ static void pair_modal_key(App *a, uint32_t key)
         return;
 
     size_t add = 0;
-    for (int i = 0; i < n && add < room; i++) {
+    for (int i = 0; i < n; ) {
         unsigned char c = (unsigned char)buf[i];
-        if (c < 0x20 || c == 0x7f)
+        size_t clen = utf8_seq_len(c);
+        if (clen == 0 || (size_t)(n - i) < clen) {
+            i++;
             continue;
-        if (u->pair_kind == PAIR_MODAL_PASSKEY && !g_ascii_isdigit(c))
+        }
+        if (clen == 1 && (c < 0x20 || c == 0x7f)) {
+            i++;
             continue;
-        u->pair_entry[len + add++] = (char)c;
+        }
+        if (u->pair_kind == PAIR_MODAL_PASSKEY &&
+            (clen != 1 || !g_ascii_isdigit(c))) {
+            i += (int)clen;
+            continue;
+        }
+        /* Never store a truncated multibyte sequence near the buffer end. */
+        if (add + clen > room)
+            break;
+        memcpy(u->pair_entry + len + add, buf + i, clen);
+        add += clen;
+        i += (int)clen;
     }
     if (add > 0) {
         u->pair_entry[len + add] = 0;
@@ -4143,6 +4364,9 @@ static void bt_agent_method_call(GDBusConnection *connection,
         return;
     }
     if (!g_strcmp0(method_name, "Release")) {
+        /* BlueZ may release us while an agent prompt is still pending;
+         * answer that invocation too or the pairing hangs until timeout. */
+        bt_agent_cancel(a);
         g_dbus_method_invocation_return_value(invocation, NULL);
         return;
     }
@@ -4150,6 +4374,15 @@ static void bt_agent_method_call(GDBusConnection *connection,
         g_dbus_method_invocation_return_dbus_error(
             invocation, "org.bluez.Error.InProgress",
             "Another pairing request is pending");
+        return;
+    }
+    /* A pair dialog and the Wi-Fi password dialog share the same geometry
+     * and keyboard focus; reject the agent call instead of stranding an
+     * invocation that would never get a dialog or a reply. */
+    if (a->ui.connect_open) {
+        g_dbus_method_invocation_return_dbus_error(
+            invocation, "org.bluez.Error.InProgress",
+            "Wi-Fi password dialog is open");
         return;
     }
 
@@ -4310,8 +4543,13 @@ static const struct wl_buffer_listener buffer_listener = {
 
 static int shm_buffer_create(App *a, ShmBuf *b, int w, int h)
 {
+    if (w <= 0 || h <= 0 || w > INT32_MAX / 4)
+        return -1;
     int stride = w * 4;
     size_t size = (size_t)stride * (size_t)h;
+    /* wl_shm_create_pool() takes an int32_t size. */
+    if (size > INT32_MAX)
+        return -1;
     int fd = create_anon_file(size);
     if (fd < 0)
         return -1;
@@ -4427,6 +4665,8 @@ static void request_frame(App *a)
     if (!a->surface || a->frame_cb)
         return;
     a->frame_cb = wl_surface_frame(a->surface);
+    if (!a->frame_cb)
+        return;
     wl_callback_add_listener(a->frame_cb, &frame_listener, a);
 }
 
@@ -4435,10 +4675,11 @@ static int app_draw(App *a, int use_cache)
     if (!a->configured || !a->surface || !a->shm)
         return 0;
 
-    int w = (int)lround(WIN_W * a->scale);
-    int h = (int)lround(WIN_H * a->scale);
-    if (w < 1 || h < 1)
+    double wd = WIN_W * a->scale, hd = WIN_H * a->scale;
+    if (!(wd >= 1.0 && hd >= 1.0 && wd <= 16384.0 && hd <= 16384.0))
         return 0;
+    int w = (int)lround(wd);
+    int h = (int)lround(hd);
 
     /* While the window is actively resizing, paint straight to the buffer.
      * Rebuilding the cached base surface at every intermediate size costs an
@@ -4487,8 +4728,10 @@ static int app_draw(App *a, int use_cache)
         cairo_save(cr);
         cairo_rectangle(cr, 0.0, 0.0, WIN_W, WIN_H);
         cairo_clip(cr);
-        if (!a->ui.connect_open)
+        if (!a->ui.connect_open && !a->ui.pair_open)
             paint_ambient(cr, &a->ui);
+        else
+            paint_hero_plate_overlay(cr, &a->ui);
         cairo_restore(cr);
     } else {
         a->base_valid = 0;
@@ -4526,8 +4769,9 @@ static void recalc_scale(App *a)
         return;
 
     int s = 0;
-    for (int i = 0; i < a->output_count; i++) {
-        if (a->outputs[i].entered && a->outputs[i].scale > s)
+    for (int i = 0; i < MAX_OUTPUTS; i++) {
+        if (a->outputs[i].output && a->outputs[i].entered &&
+            a->outputs[i].scale > s)
             s = a->outputs[i].scale;
     }
     if (s < 1)
@@ -4839,7 +5083,12 @@ static void start_wifi_connect(App *a)
     snprintf(ssid, sizeof ssid, "%s", u->connect_ssid);
     snprintf(pass, sizeof pass, "%s", u->connect_pass);
 
-    NMAccessPoint *ap = wifi_ap_by_ssid(dev, ssid);
+    /* Resolve the specific BSSID from the real SSID bytes when available;
+     * the display string is only a fallback for profiles without an AP. */
+    NMAccessPoint *ap = wifi_ap_by_raw_ssid(dev, u->connect_ssid_raw,
+                                            u->connect_ssid_len);
+    if (!ap)
+        ap = wifi_ap_by_ssid(dev, ssid);
     char ap_path[128] = "";
     if (ap) {
         const char *path = nm_object_get_path(NM_OBJECT(ap));
@@ -4861,7 +5110,11 @@ static void start_wifi_connect(App *a)
 
     NMSettingWireless *sw =
         NM_SETTING_WIRELESS(nm_setting_wireless_new());
-    GBytes *ssid_bytes = g_bytes_new(ssid, strlen(ssid));
+    /* For an in-range AP we have the real SSID bytes; the display string
+     * may be escaped, which would create a profile for the wrong network. */
+    GBytes *ssid_bytes = u->connect_ssid_len > 0
+        ? g_bytes_new(u->connect_ssid_raw, u->connect_ssid_len)
+        : g_bytes_new(ssid, strlen(ssid));
     g_object_set(sw, NM_SETTING_WIRELESS_SSID, ssid_bytes, NULL);
     g_bytes_unref(ssid_bytes);
     nm_connection_add_setting(conn, NM_SETTING(sw));
@@ -5147,6 +5400,8 @@ static void start_wifi_action(App *a, int kind, int row)
         ap = nm_device_wifi_get_access_point_by_path(
             NM_DEVICE_WIFI(dev), n->ap_path);
     if (!ap)
+        ap = wifi_ap_by_raw_ssid(dev, n->ssid_raw, n->ssid_len);
+    if (!ap)
         ap = wifi_ap_by_ssid(dev, n->ssid);
     const char *specific = ap ? nm_object_get_path(NM_OBJECT(ap)) : NULL;
 
@@ -5297,8 +5552,8 @@ static void surface_enter(void *data, struct wl_surface *surface,
 {
     (void)surface;
     App *a = data;
-    for (int i = 0; i < a->output_count; i++) {
-        if (a->outputs[i].output == output) {
+    for (int i = 0; i < MAX_OUTPUTS; i++) {
+        if (a->outputs[i].output && a->outputs[i].output == output) {
             a->outputs[i].entered = 1;
             break;
         }
@@ -5311,8 +5566,8 @@ static void surface_leave(void *data, struct wl_surface *surface,
 {
     (void)surface;
     App *a = data;
-    for (int i = 0; i < a->output_count; i++) {
-        if (a->outputs[i].output == output) {
+    for (int i = 0; i < MAX_OUTPUTS; i++) {
+        if (a->outputs[i].output && a->outputs[i].output == output) {
             a->outputs[i].entered = 0;
             break;
         }
@@ -5619,7 +5874,7 @@ static void connect_modal_close(App *a)
 static void connect_modal_open(App *a, int idx)
 {
     Ui *u = &a->ui;
-    if (u->connect_open || u->connect_busy ||
+    if (u->connect_open || u->connect_busy || u->pair_open ||
         u->wifi_action_kind != WIFI_ACTION_NONE ||
         a->bt_op != NULL ||
         idx < 0 || idx >= u->net_count)
@@ -5633,6 +5888,8 @@ static void connect_modal_open(App *a, int idx)
     u->connect_idx = idx;
     u->connect_secure = wifi_is_secure(n);
     snprintf(u->connect_ssid, sizeof u->connect_ssid, "%s", n->ssid);
+    memcpy(u->connect_ssid_raw, n->ssid_raw, sizeof u->connect_ssid_raw);
+    u->connect_ssid_len = n->ssid_len;
     snprintf(u->connect_security, sizeof u->connect_security,
              "%s", n->security);
     u->connect_pass[0] = 0;
@@ -5700,6 +5957,8 @@ static void pointer_leave(void *data, struct wl_pointer *pointer,
     a->ui.hover_enable = 0;
     a->ui.hover_bt_discoverable = 0;
     a->ui.hover_row = -1;
+    a->ui.hover_row_action = 0;
+    a->ui.hover_row_action_idx = -1;
     a->ui.hover_connect_field = 0;
     a->ui.hover_connect_cancel = 0;
     a->ui.hover_connect_submit = 0;
@@ -5836,7 +6095,8 @@ static void pointer_axis(void *data, struct wl_pointer *pointer,
 {
     (void)pointer; (void)time;
     App *a = data;
-    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL ||
+        a->ui.connect_open || a->ui.pair_open)
         return;
 
     double v = wl_fixed_to_double(value);
@@ -5987,11 +6247,23 @@ static void connect_modal_key(App *a, uint32_t key)
         return;
 
     size_t add = 0;
-    for (int i = 0; i < n && add < room; i++) {
+    for (int i = 0; i < n; ) {
         unsigned char c = (unsigned char)buf[i];
-        if (c < 0x20 || c == 0x7f)
+        size_t clen = utf8_seq_len(c);
+        if (clen == 0 || (size_t)(n - i) < clen) {
+            i++;
             continue;
-        u->connect_pass[len + add++] = (char)c;
+        }
+        if (clen == 1 && (c < 0x20 || c == 0x7f)) {
+            i++;
+            continue;
+        }
+        /* Never store a truncated multibyte sequence near the buffer end. */
+        if (add + clen > room)
+            break;
+        memcpy(u->connect_pass + len + add, buf + i, clen);
+        add += clen;
+        i += (int)clen;
     }
     if (add > 0) {
         u->connect_pass[len + add] = 0;
@@ -6076,7 +6348,8 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
 
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !a->pointer) {
         a->pointer = wl_seat_get_pointer(seat);
-        wl_pointer_add_listener(a->pointer, &pointer_listener, a);
+        if (a->pointer)
+            wl_pointer_add_listener(a->pointer, &pointer_listener, a);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && a->pointer) {
         if (a->cursor_shape_device) {
             wp_cursor_shape_device_v1_destroy(a->cursor_shape_device);
@@ -6089,7 +6362,8 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
 
     if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !a->keyboard) {
         a->keyboard = wl_seat_get_keyboard(seat);
-        wl_keyboard_add_listener(a->keyboard, &keyboard_listener, a);
+        if (a->keyboard)
+            wl_keyboard_add_listener(a->keyboard, &keyboard_listener, a);
     } else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && a->keyboard) {
         wl_keyboard_destroy(a->keyboard);
         a->keyboard = NULL;
@@ -6106,6 +6380,29 @@ static const struct wl_seat_listener seat_listener = {
     .name = seat_name,
 };
 
+static void release_seat(App *a)
+{
+    if (a->cursor_shape_device) {
+        wp_cursor_shape_device_v1_destroy(a->cursor_shape_device);
+        a->cursor_shape_device = NULL;
+        a->cursor_shape = 0;
+    }
+    if (a->pointer) {
+        wl_pointer_destroy(a->pointer);
+        a->pointer = NULL;
+    }
+    if (a->keyboard) {
+        wl_keyboard_destroy(a->keyboard);
+        a->keyboard = NULL;
+    }
+    a->keyboard_focused = 0;
+    if (a->seat) {
+        wl_seat_destroy(a->seat);
+        a->seat = NULL;
+    }
+    a->seat_global = 0;
+}
+
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version)
@@ -6113,43 +6410,65 @@ static void registry_global(void *data, struct wl_registry *registry,
     App *a = data;
 
     if (!strcmp(interface, wl_compositor_interface.name)) {
-        a->compositor = wl_registry_bind(registry, name,
-                                         &wl_compositor_interface,
-                                         version < 4 ? version : 4);
+        if (!a->compositor)
+            a->compositor = wl_registry_bind(registry, name,
+                                             &wl_compositor_interface,
+                                             version < 4 ? version : 4);
     } else if (!strcmp(interface, wl_shm_interface.name)) {
-        a->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
-        wl_shm_add_listener(a->shm, &shm_listener, a);
+        if (!a->shm) {
+            a->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+            if (a->shm)
+                wl_shm_add_listener(a->shm, &shm_listener, a);
+        }
     } else if (!strcmp(interface, xdg_wm_base_interface.name)) {
-        a->wm_base = wl_registry_bind(registry, name,
-                                      &xdg_wm_base_interface, 1);
-        xdg_wm_base_add_listener(a->wm_base, &wm_base_listener, a);
+        if (!a->wm_base) {
+            a->wm_base = wl_registry_bind(registry, name,
+                                          &xdg_wm_base_interface, 1);
+            if (a->wm_base)
+                xdg_wm_base_add_listener(a->wm_base, &wm_base_listener, a);
+        }
     } else if (!strcmp(interface,
                        zxdg_decoration_manager_v1_interface.name)) {
-        a->deco_manager = wl_registry_bind(
-            registry, name, &zxdg_decoration_manager_v1_interface, 1);
+        if (!a->deco_manager)
+            a->deco_manager = wl_registry_bind(
+                registry, name, &zxdg_decoration_manager_v1_interface, 1);
     } else if (!strcmp(interface,
                        xdg_toplevel_icon_manager_v1_interface.name)) {
-        a->icon_manager = wl_registry_bind(
-            registry, name, &xdg_toplevel_icon_manager_v1_interface, 1);
+        if (!a->icon_manager)
+            a->icon_manager = wl_registry_bind(
+                registry, name, &xdg_toplevel_icon_manager_v1_interface, 1);
     } else if (!strcmp(interface,
                        wp_cursor_shape_manager_v1_interface.name)) {
-        a->cursor_shape_manager = wl_registry_bind(
-            registry, name, &wp_cursor_shape_manager_v1_interface, 1);
+        if (!a->cursor_shape_manager)
+            a->cursor_shape_manager = wl_registry_bind(
+                registry, name, &wp_cursor_shape_manager_v1_interface, 1);
     } else if (!strcmp(interface, wl_seat_interface.name)) {
+        /* One seat is tracked; binding every seat into a->seat would make
+         * them fight over the same pointer/keyboard. */
+        if (a->seat)
+            return;
         a->seat = wl_registry_bind(registry, name, &wl_seat_interface,
                                    version < 5 ? version : 5);
-        wl_seat_add_listener(a->seat, &seat_listener, a);
+        if (a->seat) {
+            a->seat_global = name;
+            wl_seat_add_listener(a->seat, &seat_listener, a);
+        }
     } else if (!strcmp(interface, wl_output_interface.name)) {
-        if (a->output_count < MAX_OUTPUTS) {
-            Output *o = &a->outputs[a->output_count];
+        for (int i = 0; i < MAX_OUTPUTS; i++) {
+            Output *o = &a->outputs[i];
+            if (o->output)
+                continue;
             o->output = wl_registry_bind(registry, name,
                                          &wl_output_interface,
                                          version < 2 ? version : 2);
+            if (!o->output)
+                return;
+            o->global_name = name;
             o->scale = 1;
             o->entered = 0;
             o->app = a;
             wl_output_add_listener(o->output, &output_listener, o);
-            a->output_count++;
+            break;
         }
     }
 }
@@ -6157,7 +6476,21 @@ static void registry_global(void *data, struct wl_registry *registry,
 static void registry_global_remove(void *data, struct wl_registry *registry,
                                    uint32_t name)
 {
-    (void)data; (void)registry; (void)name;
+    (void)registry;
+    App *a = data;
+    if (a->seat && name == a->seat_global)
+        release_seat(a);
+    for (int i = 0; i < MAX_OUTPUTS; i++) {
+        Output *o = &a->outputs[i];
+        if (!o->output || o->global_name != name)
+            continue;
+        wl_output_destroy(o->output);
+        o->output = NULL;
+        o->entered = 0;
+        /* Drop this output's scale now; a compositor may never send
+         * surface.leave after the output is gone. */
+        recalc_scale(a);
+    }
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -6204,8 +6537,10 @@ static int wayland_start(App *a)
     }
 
     a->xdg_surface = xdg_wm_base_get_xdg_surface(a->wm_base, a->surface);
+    if (!a->xdg_surface) return 0;
     xdg_surface_add_listener(a->xdg_surface, &xdg_surface_listener, a);
     a->toplevel = xdg_surface_get_toplevel(a->xdg_surface);
+    if (!a->toplevel) return 0;
     xdg_toplevel_add_listener(a->toplevel, &toplevel_listener, a);
     xdg_toplevel_set_title(a->toplevel, "JTLab Networks");
     xdg_toplevel_set_app_id(a->toplevel, "jtnetworks");
@@ -6226,10 +6561,12 @@ static int wayland_start(App *a)
     if (a->deco_manager) {
         a->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
             a->deco_manager, a->toplevel);
-        zxdg_toplevel_decoration_v1_add_listener(
-            a->decoration, &decoration_listener, a);
-        zxdg_toplevel_decoration_v1_set_mode(
-            a->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        if (a->decoration) {
+            zxdg_toplevel_decoration_v1_add_listener(
+                a->decoration, &decoration_listener, a);
+            zxdg_toplevel_decoration_v1_set_mode(
+                a->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        }
     }
 
     if (a->icon_manager) {
@@ -6326,17 +6663,27 @@ static void
 ctl_read_client(App *a)
 {
     char buf[128];
-    for (;;) {
+    /* Bound the work per event-loop turn: a peer streaming newlines must not
+     * starve Wayland events.  The fd is non-blocking; leftovers are handled
+     * on the next poll iteration. */
+    for (int budget = 32; budget > 0; budget--) {
         ssize_t n = read(a->ctl_client_fd, buf, sizeof(buf));
         if (n > 0) {
-            size_t room = sizeof(a->ctl_buf) - 1 - a->ctl_len;
-            if ((size_t)n > room) {
-                ctl_close_client(a);
-                return;
+            /* Process each chunk incrementally: a read can complete one line
+             * and free space for the rest of the same read. */
+            size_t off = 0;
+            while (off < (size_t)n) {
+                size_t room = sizeof(a->ctl_buf) - 1 - a->ctl_len;
+                if (room == 0) {
+                    ctl_close_client(a);
+                    return;
+                }
+                size_t add = room < (size_t)n - off ? room : (size_t)n - off;
+                memcpy(a->ctl_buf + a->ctl_len, buf + off, add);
+                a->ctl_len += add;
+                off += add;
+                ctl_process(a, 0);
             }
-            memcpy(a->ctl_buf + a->ctl_len, buf, (size_t)n);
-            a->ctl_len += (size_t)n;
-            ctl_process(a, 0);
             continue;
         }
         if (n == 0) {
@@ -6358,7 +6705,8 @@ ctl_read_client(App *a)
 static void
 ctl_accept(App *a)
 {
-    for (;;) {
+    /* Cap accepts per turn so a connection flood cannot spin here forever. */
+    for (int budget = 8; budget > 0; budget--) {
         int fd = accept4(a->ctl_fd, NULL, NULL,
                          SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (fd < 0) {
@@ -6395,7 +6743,12 @@ ctl_start(App *a)
         perror("jtnetworks: control socket");
         return 0;
     }
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    /* A Unix socket's mode is fixed at bind() from the umask.  Without this
+     * the /tmp fallback leaves a world-connectable control socket. */
+    mode_t old_umask = umask(0077);
+    int bound = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    umask(old_umask);
+    if (bound < 0) {
         fprintf(stderr, "jtnetworks: cannot bind %s: %s\n",
                 path, strerror(errno));
         close(fd);
@@ -6557,14 +6910,7 @@ static void app_cleanup(App *a)
         a->base = NULL;
         a->base_valid = 0;
     }
-    if (a->keyboard)
-        wl_keyboard_destroy(a->keyboard);
-    if (a->cursor_shape_device) {
-        wp_cursor_shape_device_v1_destroy(a->cursor_shape_device);
-        a->cursor_shape_device = NULL;
-    }
-    if (a->pointer)
-        wl_pointer_destroy(a->pointer);
+    release_seat(a);
     if (a->cursor_shape_manager)
         wp_cursor_shape_manager_v1_destroy(a->cursor_shape_manager);
     if (a->decoration)
@@ -6575,8 +6921,6 @@ static void app_cleanup(App *a)
         xdg_surface_destroy(a->xdg_surface);
     if (a->surface)
         wl_surface_destroy(a->surface);
-    if (a->seat)
-        wl_seat_destroy(a->seat);
     if (a->deco_manager)
         zxdg_decoration_manager_v1_destroy(a->deco_manager);
     if (a->icon_manager)
@@ -6588,9 +6932,11 @@ static void app_cleanup(App *a)
     if (a->compositor)
         wl_compositor_destroy(a->compositor);
 
-    for (int i = 0; i < a->output_count; i++) {
-        if (a->outputs[i].output)
+    for (int i = 0; i < MAX_OUTPUTS; i++) {
+        if (a->outputs[i].output) {
             wl_output_destroy(a->outputs[i].output);
+            a->outputs[i].output = NULL;
+        }
     }
     if (a->registry)
         wl_registry_destroy(a->registry);
@@ -6716,6 +7062,10 @@ static int write_screenshot(const char *path, const char *tab_name, int off)
         } else {
             u.bt_on = 0;
             u.bt_k = 0.0;
+            u.bt_discovering = 0;
+            u.bt_discovery_pending = 0;
+            u.bt_discovery_stopping = 0;
+            u.bt_found_count = 0;
         }
     } else {
         seed_demo(&u);
@@ -6723,6 +7073,11 @@ static int write_screenshot(const char *path, const char *tab_name, int off)
 
     cairo_surface_t *surf = cairo_image_surface_create(
         CAIRO_FORMAT_ARGB32, (int)WIN_W, (int)WIN_H);
+    if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(surf);
+        fprintf(stderr, "jtnetworks: could not create screenshot surface\n");
+        return 1;
+    }
     cairo_t *cr = cairo_create(surf);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     rgba(cr, 0x1A1A1C, 1.0);
@@ -6774,6 +7129,10 @@ static void ui_step(Ui *u, double dt)
 
 int main(int argc, char **argv)
 {
+    /* Must run before any cairo/Pango font lookup so glyphs are antialiased
+     * even when the host fontconfig disables it globally. */
+    ensure_font_antialiasing();
+
     if (!accent_cli(&argc, argv))
         return 2;
 
@@ -7002,10 +7361,13 @@ int main(int argc, char **argv)
         int need_draw = a.dirty || animating || ambient || caret_animating;
         int due = a.dirty || a.last_draw == 0.0 ||
                   now - a.last_draw >= interval;
+        int draw_failed = 0;
         if (need_draw && due && !a.frame_cb) {
             if (app_draw(&a, use_cache)) {
                 a.dirty = 0;
                 a.last_draw = now;
+            } else {
+                draw_failed = 1;
             }
         }
 
@@ -7021,6 +7383,10 @@ int main(int argc, char **argv)
             double wait = interval - (mono_sec() - a.last_draw);
             if (wait < 0.0) wait = 0.0;
             timeout = (int)(wait * 1000.0) + 1;
+            /* A failed draw (all SHM buffers busy) must not spin at 1 ms;
+             * wl_buffer.release wakes poll() when a buffer frees up. */
+            if (draw_failed && timeout < 16)
+                timeout = 16;
         }
         if (a.resync_at > 0.0) {
             double wait = a.resync_at - mono_sec();
