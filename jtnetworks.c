@@ -3066,6 +3066,28 @@ static void nm_prop_cb(GObject *object, GParamSpec *pspec, gpointer user_data)
     nm_ui_refresh(user_data);
 }
 
+/* RequestScan's async callback fires as soon as the scan is requested, not
+ * when it finishes.  The AP list and last-scan property change later, so
+ * those are the events that must refresh the network list. */
+static void nm_wifi_device_watch(App *a, NMDevice *dev)
+{
+    if (!dev || !NM_IS_DEVICE_WIFI(dev))
+        return;
+    g_signal_connect(dev, "access-point-added",
+                     G_CALLBACK(nm_changed_cb), a);
+    g_signal_connect(dev, "access-point-removed",
+                     G_CALLBACK(nm_changed_cb), a);
+    g_signal_connect(dev, "notify::last-scan",
+                     G_CALLBACK(nm_prop_cb), a);
+}
+
+static void nm_device_added_cb(NMClient *client, NMDevice *dev,
+                               gpointer user_data)
+{
+    nm_wifi_device_watch(user_data, dev);
+    nm_changed_cb(client, dev, user_data);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Bluetooth — BlueZ D-Bus API through GDBus                          */
 /* ------------------------------------------------------------------ */
@@ -7209,13 +7231,14 @@ int main(int argc, char **argv)
         g_signal_connect(a.nm, "connection-removed",
                          G_CALLBACK(nm_changed_cb), &a);
         g_signal_connect(a.nm, "device-added",
-                         G_CALLBACK(nm_changed_cb), &a);
+                         G_CALLBACK(nm_device_added_cb), &a);
         g_signal_connect(a.nm, "device-removed",
                          G_CALLBACK(nm_changed_cb), &a);
         g_signal_connect(a.nm, "active-connection-added",
                          G_CALLBACK(nm_changed_cb), &a);
         g_signal_connect(a.nm, "active-connection-removed",
                          G_CALLBACK(nm_changed_cb), &a);
+        nm_wifi_device_watch(&a, wifi_device(a.nm));
     }
 
     GError *bt_err = NULL;
